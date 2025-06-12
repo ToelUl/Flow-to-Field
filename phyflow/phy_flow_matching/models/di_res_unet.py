@@ -5,7 +5,7 @@ DiResUnet Implementation and Associated Modules.
 
 This script defines various PyTorch modules inspired by recent trends in
 generative modeling (like Diffusion Transformers - DiT), including:
-- Depthwise Separable Convolution (DWConv)
+- Depthwise Separable Convolution (DConv)
 - DiT-inspired Residual Block (DiResBlock) with internal Attention and MLP
 - Multi-Head Self-Attention (Attention)
 - ConvNeXt V2 style MLP
@@ -19,9 +19,6 @@ featuring multiscale input handling and multi-conditional embedding capabilities
 A test suite is included for validation.
 """
 
-__author__ = "Qian-Rui Lee"
-
-
 import math
 import traceback
 from functools import partial
@@ -31,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from timm.layers import LayerNorm2d
 
 # Global flag to control detailed test output
 VERBOSE_TEST = False # Set to True for more detailed module prints during tests
@@ -102,10 +100,10 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 
 
 # ==============================================================================
-# Module: DWConv (Depthwise Separable Convolution)
+# Module: DConv (Depthwise Separable Convolution)
 # ==============================================================================
 
-class DWConv(nn.Module):
+class DConv(nn.Module):
     """Depthwise Separable Convolution module.
 
     Factorizes a standard convolution into a depthwise convolution followed by
@@ -313,7 +311,7 @@ class Attention(nn.Module):
         num_heads: int = 8,
         num_groups: int = 4,
         qkv_bias: bool = True,
-        padding_mode: str = "circular"  # Use circular padding for periodic fields,
+        padding_mode: str = "circular"
     ):
         super().__init__()
         self.channels = channels
@@ -354,7 +352,7 @@ class Attention(nn.Module):
         # Layers
         self.norm = nn.GroupNorm(self.num_groups, channels)
         # Project input to Q, K, V tensors
-        self.to_qkv_3 = DWConv(channels, channels * 3, kernel_size=3, padding=1, bias=qkv_bias,
+        self.to_qkv_3 = DConv(channels, channels * 3, kernel_size=3, padding=1, bias=qkv_bias,
                                padding_mode=padding_mode)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -468,7 +466,7 @@ class Mlp(nn.Module):
         act_layer (nn.Module, optional): Activation function. Defaults to `nn.GELU`.
         norm_layer (nn.Module, optional): Normalization layer constructor.
             Defaults to `nn.LayerNorm`.
-        bias (bool, optional): If True, add bias to the DWConv layers. Defaults to True.
+        bias (bool, optional): If True, add bias to the DConv layers. Defaults to True.
         drop (float, optional): Dropout rate. Defaults to 0.0.
         padding_mode (str, optional): Padding mode for the depthwise convolution.
             Defaults to "circular" for periodic fields.
@@ -480,7 +478,7 @@ class Mlp(nn.Module):
         hidden_features: Optional[int] = None,
         out_features: Optional[int] = None,
         act_layer: nn.Module = nn.GELU,
-        norm_layer: nn.Module = nn.LayerNorm,
+        norm_layer: nn.Module = LayerNorm2d,
         bias: bool = True,
         drop: float = 0.0,
         padding_mode: str = "circular"  # Use circular padding for periodic fields
@@ -530,7 +528,7 @@ class Mlp(nn.Module):
             Tensor: Output tensor, shape (B, C_out, H, W).
         """
         x = self.fc1(x)
-        x = self.norm1(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = self.norm1(x)
         x = self.fc2(x)
         x = self.act(x)
         x = self.norm2(x)
@@ -565,7 +563,7 @@ class ECA_block(nn.Module):
         sigmoid (nn.Sigmoid): Sigmoid activation for generating attention weights.
     """
     def __init__(self, channel: int, b: int = 1, gamma: int = 2):
-        super(ECA_block, self).__init__()
+        super().__init__()
         # Compute adaptive kernel size: k = |log2(C)/γ + b|
         kernel_size = int(abs((math.log(channel, 2) + b) / gamma))
         # Ensure the kernel size is odd (for symmetric padding)
@@ -651,7 +649,7 @@ class DiResBlock(nn.Module):
         num_heads: int = 8,
         num_groups: int = 4,
         dropout: float = 0.0,
-        padding_mode: str = "circular"  # Use circular padding for periodic fields
+        padding_mode: str = "circular"
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -841,7 +839,7 @@ class Upsample(nn.Module):
 
     Increases spatial resolution by `scale_factor`. It first uses a convolution
     to increase channels, then PixelShuffle rearranges elements, and finally
-    an optional 3x3 convolution refines features. Uses DWConv for convolutions.
+    an optional 3x3 convolution refines features. Uses DConv for convolutions.
 
     Handles `channels = 0` by returning a correctly shaped zero tensor, avoiding
     errors with zero-channel convolutions.
@@ -869,13 +867,15 @@ class Upsample(nn.Module):
             self.scale_factor_squared = scale_factor * scale_factor
 
             # Conv to prepare channels for PixelShuffle: C -> C * scale_factor^2
-            # Using DWConv consistent with other blocks
-            self.conv1 = DWConv(
-                self.channels,
-                self.channels * self.scale_factor_squared,
-                kernel_size=3,
-                padding=1,
-                padding_mode=padding_mode, # Use circular padding for periodic fields
+            # Using DConv consistent with other blocks
+            self.conv1 = (
+                DConv(
+                    self.channels,
+                    self.channels * self.scale_factor_squared,
+                    kernel_size=3,
+                    padding=1,
+                    padding_mode=padding_mode,
+                )
             )
 
             # PixelShuffle layer: Rearranges (C * r^2, H, W) -> (C, H * r, W * r)
@@ -883,7 +883,7 @@ class Upsample(nn.Module):
 
             # Optional final convolution for refinement (operates on C channels)
             self.conv2 = (
-                DWConv(
+                DConv(
                     self.channels,
                     self.channels,
                     kernel_size=3,
@@ -943,39 +943,25 @@ class Upsample(nn.Module):
 # ==============================================================================
 
 class Downsample(nn.Module):
-    """Downsampling layer using either strided convolution or average pooling.
+    """Downsampling layer using convolution and pooling.
 
-    Reduces spatial resolution by a factor of 2. Uses DWConv if `use_conv=True`.
+    Reduces spatial resolution by a factor of 2.
     Handles `channels = 0` by explicitly returning a downsampled zero tensor.
 
     Args:
         channels (int): Number of input channels. Determines operation if > 0.
-        use_conv (bool): If True and channels > 0, use a strided 3x3 DWConv
-            for downsampling. If False or channels <= 0, use `nn.AvgPool2d`
-            (though AvgPool won't be directly called if C=0 due to forward logic).
-            Defaults to True.
         padding_mode (str): Padding mode for the depthwise convolution.
     """
 
-    def __init__(self, channels: int, use_conv: bool = True, padding_mode: str = "circular"):
+    def __init__(self, channels: int, padding_mode: str = "circular"):
         super().__init__()
-        self.channels = channels
 
-        # Define the operation for the non-zero channel case.
-        # The C=0 case will be handled explicitly in forward().
-        if channels > 0:
-            if use_conv:
-                # Learnable downsampling via strided convolution (DWConv)
-                self.op = DWConv(
-                    channels, channels, kernel_size=3, stride=2, padding=1, padding_mode=padding_mode
-                )
-            else:
-                # Fixed downsampling via average pooling
-                self.op = nn.AvgPool2d(kernel_size=2, stride=2)
-        else:
-            # Assign Identity for C<=0 case in init, as forward handles it.
-            # Or could assign AvgPool, it just won't be called for C=0 input.
-            self.op = nn.Identity()
+        self.conv_in = DConv(
+            channels, channels, kernel_size=3, stride=2, padding=1, padding_mode=padding_mode
+        ) if channels > 0 else nn.Identity()
+        self.avg_pool = nn.AvgPool2d(kernel_size=2, stride=2) if channels > 0 else nn.Identity()
+        self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2) if channels > 0 else nn.Identity()
+        self.conv_out = nn.Conv2d(channels*3, channels, kernel_size=1, bias=False) if channels > 0 else nn.Identity()
 
 
     def forward(self, x: Tensor) -> Tensor:
@@ -996,8 +982,91 @@ class Downsample(nn.Module):
             # print(f"Debug Downsample C=0: Input {x.shape}, Output ({B}, 0, {out_H}, {out_W})") # Optional debug print
             return torch.zeros((B, 0, out_H, out_W), dtype=x.dtype, device=x.device)
         else:
-            # Apply the standard operation for non-zero channels
-            return self.op(x)
+            conv_feature = self.conv_in(x)  # (B, C, H/2, W/2)
+            avg_pooled_feature = self.avg_pool(x)  # (B, C, H/2, W/2)
+            max_pooled_feature = self.max_pool(x)  # (B, C, H/2, W/2)
+            features = torch.cat([conv_feature, avg_pooled_feature, max_pooled_feature], dim=1)
+            return self.conv_out(features)  # (B, C, H/2, W/2)
+
+
+# ==============================================================================
+# Module: Triplet Attention
+# ==============================================================================
+
+class ZPool(nn.Module):
+    """Z-Pool operator: concat of channel-wise max & average pooling."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: B×C×H×W → outputs B×2×H×W
+        max_pool = torch.max(x, dim=1, keepdim=True)[0]
+        avg_pool = torch.mean(x, dim=1, keepdim=True)
+        return torch.cat([max_pool, avg_pool], dim=1)
+
+
+class AttentionGate(nn.Module):
+    """Single attention branch using ZPool + conv + sigmoid."""
+    def __init__(self, kernel_size: int = 7):
+        """
+        Args:
+            kernel_size: Spatial kernel size for attention conv.
+        """
+        super().__init__()
+        padding = (kernel_size - 1) // 2
+        self.compress = ZPool()
+        self.conv = nn.Conv2d(
+            2, 1,
+            kernel_size=kernel_size,
+            padding=padding,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape B×C×H×W.
+        Returns:
+            Tensor of same shape, modulated by attention weights.
+        """
+        x_pool = self.compress(x)             # B×2×H×W
+        x_attn = self.conv(x_pool)            # B×1×H×W
+        scale = torch.sigmoid_(x_attn)        # B×1×H×W
+        return x * scale                      # broadcast over channel dim
+
+
+class TripletAttention(nn.Module):
+    """
+    Triplet Attention module: captures cross-dimension interaction
+    via three AttentionGate branches. https://arxiv.org/abs/2010.03045
+    """
+    def __init__(self, no_spatial: bool = False,):
+        """
+        Args:
+            no_spatial: If True, omit the HW spatial branch.
+        """
+        super().__init__()
+        self.cw = AttentionGate()   # Channel–Width
+        self.hc = AttentionGate()   # Height–Channel
+        self.no_spatial = no_spatial
+        if not no_spatial:
+            self.hw = AttentionGate()  # Height–Width
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor B×C×H×W.
+        Returns:
+            Attention-modulated tensor, same shape as x.
+        """
+        # CW branch
+        x_perm1 = x.permute(0, 2, 1, 3).contiguous()
+        x_out1 = self.cw(x_perm1).permute(0, 2, 1, 3).contiguous()
+        # HC branch
+        x_perm2 = x.permute(0, 3, 2, 1).contiguous()
+        x_out2 = self.hc(x_perm2).permute(0, 3, 2, 1).contiguous()
+        if not self.no_spatial:
+            # HW branch (standard spatial)
+            x_out3 = self.hw(x)
+            return (x_out1 + x_out2 + x_out3) / 3.0
+        else:
+            return (x_out1 + x_out2) / 2.0
 
 
 # ==============================================================================
@@ -1019,7 +1088,7 @@ class DiResUnet(nn.Module):
       dynamically based on max channel count) followed by MLPs.
     - Optional multiple conditional embeddings, each processed similarly and
       combined with the time embedding before modulation in DiResBlocks.
-    - Uses `DWConv` within `Upsample`, `Downsample`, and `Mlp` (inside DiResBlock).
+    - Uses `DConv` within `Upsample`, `Downsample`, and `Mlp` (inside DiResBlock).
     - Handles variable input HxW dimensions in the forward pass.
 
     Args:
@@ -1029,7 +1098,7 @@ class DiResUnet(nn.Module):
             Defaults to 16. Must be positive.
         channel_mult (Sequence[int]): Multipliers for `model_channels` at each
             resolution level (encoder/decoder). Determines depth and channel count.
-            Example: (1, 2, 4, 8). Defaults to (4, 4). Must not be empty.
+            Example: (1, 2, 4, 8). Defaults to (2, 2, 4). Must not be empty.
         num_res_blocks (int): Number of `DiResBlock` instances per resolution level.
             Defaults to 1.
         dropout (float): Dropout probability in `DiResBlock`'s MLP. Defaults to 0.1.
@@ -1057,7 +1126,7 @@ class DiResUnet(nn.Module):
         in_channels: int = 1,
         out_channels: int = 1,
         model_channels: int = 32,
-        channel_mult: Sequence[int] = (4, 4),
+        channel_mult: Sequence[int] = (2, 2, 4),
         num_res_blocks: int = 1,
         dropout: float = 0.1,
         num_heads: int = 32, # Default heads for DiResBlock
@@ -1153,6 +1222,10 @@ class DiResUnet(nn.Module):
              self.cond_embedders = None
              self.cond_mlps = None
 
+        self.fusion_mlp = nn.Linear(
+            self.final_emb_dim * 2, self.final_emb_dim
+        ) if self.use_condition else None
+
         # --- Input Convolution ---
         # Use standard Conv2d for initial projection unless specified otherwise
         self.conv_in = nn.Conv2d(
@@ -1197,8 +1270,8 @@ class DiResUnet(nn.Module):
 
             # Add downsampling layer (except for the last level)
             if i < self.num_downsamples:
-                 # use_conv=True uses DWConv for downsampling
-                 self.down_sample.append(Downsample(channels=current_channels, use_conv=True, padding_mode=padding_mode))
+                 # use_conv=True uses DConv for downsampling
+                 self.down_sample.append(Downsample(channels=current_channels, padding_mode=padding_mode))
             else:
                  # No downsampling after the last encoder level (leads to bottleneck)
                  self.down_sample.append(nn.Identity())
@@ -1216,6 +1289,9 @@ class DiResUnet(nn.Module):
                 dropout=dropout,
                 padding_mode=padding_mode,
             ) if bottleneck_channels > 0 else nn.Identity(),
+
+            TripletAttention() if bottleneck_channels > 0 else nn.Identity(),
+
             DiResBlock(
                 in_channels=bottleneck_channels,
                 out_channels=bottleneck_channels,
@@ -1225,6 +1301,8 @@ class DiResUnet(nn.Module):
                 dropout=dropout,
                 padding_mode=padding_mode,
             ) if bottleneck_channels > 0 else nn.Identity(),
+
+            TripletAttention() if bottleneck_channels > 0 else nn.Identity(),
         )
 
         # --- Upsampling Path (Decoder) ---
@@ -1308,7 +1386,8 @@ class DiResUnet(nn.Module):
             out_channels,
             kernel_size=3,
             padding=1,
-            padding_mode=padding_mode) if final_decoder_channels > 0 and out_channels >= 0 else nn.Identity() # Allow 0 out_channels
+            padding_mode=padding_mode
+        ) if final_decoder_channels > 0 and out_channels >= 0 else nn.Identity() # Allow 0 out_channels
 
 
     def forward(self, x: Tensor, time: Tensor, conditions: Optional[Sequence[Tensor]] = None) -> Tensor:
@@ -1396,7 +1475,8 @@ class DiResUnet(nn.Module):
                  c_emb = mlp(c_emb) # (B, final_emb_dim)
                  total_cond_emb = total_cond_emb + c_emb # Accumulate embeddings
 
-             final_emb = final_emb + total_cond_emb # Combine time and total condition embeddings
+             final_emb = self.fusion_mlp(torch.cat([final_emb, total_cond_emb], dim=-1)) \
+                 if self.fusion_mlp else total_cond_emb + final_emb
         # else: final_emb remains just t_emb
 
         # --- 2. Initial Convolution ---
@@ -1568,13 +1648,13 @@ if __name__ == "__main__":
         assert out_2d.shape == x_2d.shape, f"Modulate 2D shape mismatch: {out_2d.shape} vs {x_2d.shape}"
         print("✅ modulate(2D) PASSED.")
 
-        # Test DWConv
-        print("\nTesting DWConv...")
-        dw_conv = DWConv(helper_C_in, helper_C_out, kernel_size=3, padding=1, stride=1, bias=True).to(device)
+        # Test DConv
+        print("\nTesting DConv...")
+        dw_conv = DConv(helper_C_in, helper_C_out, kernel_size=3, padding=1, stride=1, bias=True).to(device)
         x = torch.randn(helper_test_B, helper_C_in, helper_H, helper_W, device=device)
         output = dw_conv(x)
-        assert output.shape == (helper_test_B, helper_C_out, helper_H, helper_W), f"DWConv shape mismatch: {output.shape}"
-        print("✅ DWConv PASSED.")
+        assert output.shape == (helper_test_B, helper_C_out, helper_H, helper_W), f"DConv shape mismatch: {output.shape}"
+        print("✅ DConv PASSED.")
 
         # Test SinusoidalPosEmb
         print("\nTesting SinusoidalPosEmb...")
@@ -1645,12 +1725,12 @@ if __name__ == "__main__":
         # Test Downsample
         print("\nTesting Downsample...")
         down_ch = helper_C_in
-        downsample_conv = Downsample(channels=down_ch, use_conv=True).to(device)
+        downsample_conv = Downsample(channels=down_ch).to(device)
         x_down = torch.randn(helper_test_B, down_ch, helper_H, helper_W, device=device)
         output_down_conv = downsample_conv(x_down)
         assert output_down_conv.shape == (helper_test_B, down_ch, helper_H // 2, helper_W // 2), f"Downsample (conv=True) shape mismatch: {output_down_conv.shape}"
-        print("✅ Downsample (conv=True) PASSED.")
-        downsample_zero = Downsample(channels=0, use_conv=True).to(device)
+        print("✅ Downsample PASSED.")
+        downsample_zero = Downsample(channels=0).to(device)
         x_zero = torch.randn(helper_test_B, 0, helper_H, helper_W, device=device)
         output_zero = downsample_zero(x_zero)
         assert output_zero.shape == (helper_test_B, 0, helper_H // 2, helper_W // 2), f"Downsample (C=0) shape mismatch: {output_zero.shape}"

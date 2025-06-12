@@ -5,6 +5,7 @@ from .phy_flow_matching import (
     CFMWrapper,
     logit_normal_sampler,
     timestep_scheduler,
+    RandomRoll,
     CFMExecutor,
 )
 
@@ -24,5 +25,6 @@ __all__ = [
     'CFMWrapper',
     'logit_normal_sampler',
     'timestep_scheduler',
+    'RandomRoll',
     'CFMExecutor',
 ]
