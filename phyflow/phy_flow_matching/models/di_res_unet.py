@@ -990,86 +990,6 @@ class Downsample(nn.Module):
 
 
 # ==============================================================================
-# Module: Triplet Attention
-# ==============================================================================
-
-class ZPool(nn.Module):
-    """Z-Pool operator: concat of channel-wise max & average pooling."""
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: B×C×H×W → outputs B×2×H×W
-        max_pool = torch.max(x, dim=1, keepdim=True)[0]
-        avg_pool = torch.mean(x, dim=1, keepdim=True)
-        return torch.cat([max_pool, avg_pool], dim=1)
-
-
-class AttentionGate(nn.Module):
-    """Single attention branch using ZPool + conv + sigmoid."""
-    def __init__(self, kernel_size: int = 7):
-        """
-        Args:
-            kernel_size: Spatial kernel size for attention conv.
-        """
-        super().__init__()
-        padding = (kernel_size - 1) // 2
-        self.compress = ZPool()
-        self.conv = nn.Conv2d(
-            2, 1,
-            kernel_size=kernel_size,
-            padding=padding,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor of shape B×C×H×W.
-        Returns:
-            Tensor of same shape, modulated by attention weights.
-        """
-        x_pool = self.compress(x)             # B×2×H×W
-        x_attn = self.conv(x_pool)            # B×1×H×W
-        scale = torch.sigmoid_(x_attn)        # B×1×H×W
-        return x * scale                      # broadcast over channel dim
-
-
-class TripletAttention(nn.Module):
-    """
-    Triplet Attention module: captures cross-dimension interaction
-    via three AttentionGate branches. https://arxiv.org/abs/2010.03045
-    """
-    def __init__(self, no_spatial: bool = False,):
-        """
-        Args:
-            no_spatial: If True, omit the HW spatial branch.
-        """
-        super().__init__()
-        self.cw = AttentionGate()   # Channel–Width
-        self.hc = AttentionGate()   # Height–Channel
-        self.no_spatial = no_spatial
-        if not no_spatial:
-            self.hw = AttentionGate()  # Height–Width
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor B×C×H×W.
-        Returns:
-            Attention-modulated tensor, same shape as x.
-        """
-        # CW branch
-        x_perm1 = x.permute(0, 2, 1, 3).contiguous()
-        x_out1 = self.cw(x_perm1).permute(0, 2, 1, 3).contiguous()
-        # HC branch
-        x_perm2 = x.permute(0, 3, 2, 1).contiguous()
-        x_out2 = self.hc(x_perm2).permute(0, 3, 2, 1).contiguous()
-        if not self.no_spatial:
-            # HW branch (standard spatial)
-            x_out3 = self.hw(x)
-            return (x_out1 + x_out2 + x_out3) / 3.0
-        else:
-            return (x_out1 + x_out2) / 2.0
-
-
-# ==============================================================================
 # Main Model: DiResUnet
 # ==============================================================================
 
@@ -1279,30 +1199,27 @@ class DiResUnet(nn.Module):
         # --- Bottleneck ---
         bottleneck_channels = current_channels # Channels from the last encoder level
         # Use two DiResBlocks in the bottleneck
-        self.middle_block = nn.Sequential(
-            DiResBlock(
-                in_channels=bottleneck_channels,
-                out_channels=bottleneck_channels,
-                emb_dim=self.final_emb_dim,
-                num_heads=num_heads,
-                num_groups=num_groups,
-                dropout=dropout,
-                padding_mode=padding_mode,
-            ) if bottleneck_channels > 0 else nn.Identity(),
-
-            TripletAttention() if bottleneck_channels > 0 else nn.Identity(),
-
-            DiResBlock(
-                in_channels=bottleneck_channels,
-                out_channels=bottleneck_channels,
-                emb_dim=self.final_emb_dim,
-                num_heads=num_heads,
-                num_groups=num_groups,
-                dropout=dropout,
-                padding_mode=padding_mode,
-            ) if bottleneck_channels > 0 else nn.Identity(),
-
-            TripletAttention() if bottleneck_channels > 0 else nn.Identity(),
+        self.middle_block = nn.ModuleList(
+            [
+                DiResBlock(
+                    in_channels=bottleneck_channels,
+                    out_channels=bottleneck_channels,
+                    emb_dim=self.final_emb_dim,
+                    num_heads=num_heads,
+                    num_groups=num_groups,
+                    dropout=dropout,
+                    padding_mode=padding_mode,
+                ) if bottleneck_channels > 0 else nn.Identity(),
+                DiResBlock(
+                    in_channels=bottleneck_channels,
+                    out_channels=bottleneck_channels,
+                    emb_dim=self.final_emb_dim,
+                    num_heads=num_heads,
+                    num_groups=num_groups,
+                    dropout=dropout,
+                    padding_mode=padding_mode,
+                ) if bottleneck_channels > 0 else nn.Identity(),
+            ]
         )
 
         # --- Upsampling Path (Decoder) ---
@@ -1499,10 +1416,11 @@ class DiResUnet(nn.Module):
 
         # --- 4. Bottleneck ---
         # Apply bottleneck layers sequentially, passing embedding
-        if isinstance(self.middle_block[0], DiResBlock):
-             h = self.middle_block[0](h, final_emb)
-        if isinstance(self.middle_block[1], DiResBlock):
-             h = self.middle_block[1](h, final_emb)
+        for module in self.middle_block:
+            if isinstance(module, DiResBlock):
+                h = module(h, final_emb)
+            else:
+                pass
 
 
         # --- 5. Upsampling Path (Decoder) ---
