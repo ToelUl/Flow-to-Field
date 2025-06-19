@@ -278,11 +278,88 @@ class SinusoidalPosEmb(nn.Module):
 
 
 # ==============================================================================
+# Module: ECA_block (Efficient Channel Attention Block)
+# ==============================================================================
+
+class ECA_block(nn.Module):
+    """Efficient Channel Attention (ECA) block.
+
+    This module implements the ECA mechanism as described in:
+    "ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks"
+    (https://arxiv.org/abs/1910.03151).
+
+    The ECA block adaptively selects a one-dimensional convolution kernel size
+    based on the number of input channels to capture cross-channel interaction
+    without dimensionality reduction.
+
+    Args:
+        channels (int): Number of input channels.
+        b (int, optional): Bias term for kernel size calculation. Defaults to 1.
+        gamma (int, optional): Scaling parameter for kernel size calculation. Defaults to 2.
+
+    Attributes:
+        avg_pool (nn.AdaptiveAvgPool2d): Global average pooling layer.
+        conv (nn.Conv1d): 1D convolution for adaptive channel attention.
+        sigmoid (nn.Sigmoid): Sigmoid activation for generating attention weights.
+    """
+    def __init__(self, channels: int, b: int = 1, gamma: int = 2):
+        super().__init__()
+        # Compute adaptive kernel size: k = |log2(C)/γ + b|
+        kernel_size = int(abs((math.log(channels, 2) + b) / gamma))
+        # Ensure the kernel size is odd (for symmetric padding)
+        kernel_size = kernel_size if (kernel_size % 2 == 1) else (kernel_size + 1)
+
+        # Global spatial information aggregation: output size is (batch, channel, 1, 1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # 1D convolution across the channel dimension to capture local cross-channel interactions
+        self.conv = nn.Conv1d(
+            in_channels=1,
+            out_channels=1,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+            bias=False
+        )
+        # Sigmoid activation to produce attention weights in [0, 1]
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass for the ECA block.
+
+        Args:
+            x (torch.Tensor): Input feature map of shape (batch, channel, height, width).
+
+        Returns:
+            torch.Tensor: Recalibrated feature map with the same shape as input.
+        """
+        # Step 1: Aggregate spatial information for each channel
+        y = self.avg_pool(x)  # shape: (batch, channel, 1, 1)
+
+        # Step 2: Prepare for 1D convolution:
+        #       squeeze last dim -> (batch, channel, 1)
+        #       transpose -> (batch, 1, channel)
+        y = y.squeeze(-1).transpose(-1, -2)
+
+        # Step 3: Apply 1D convolution and restore dimensions:
+        #       convolved -> (batch, 1, channel)
+        #       transpose -> (batch, channel, 1)
+        #       unsqueeze back to 4D -> (batch, channel, 1, 1)
+        y = self.conv(y).transpose(-1, -2).unsqueeze(-1)
+
+        # Step 4: Generate channel-wise attention weights
+        y = self.sigmoid(y)
+
+        # Step 5: Recalibrate input features by channel-wise multiplication
+        out = x * y.expand_as(x)
+
+        return out
+
+
+# ==============================================================================
 # Module: Attention (Multi-Head Self-Attention)
 # ==============================================================================
 
 class Attention(nn.Module):
-    """Multi-Head Self-Attention module with Group Normalization.
+    """Multi-Head Self-Attention module.
 
     Includes a residual connection. Handles input with 0 channels by acting
     as an identity operation.
@@ -292,8 +369,6 @@ class Attention(nn.Module):
             acts as an identity.
         num_heads (int): Number of attention heads. `channels` must be divisible
             by `num_heads` if `channels > 0`. Defaults to 8.
-        num_groups (int): Number of groups for Group Normalization. Will be
-            adjusted to a valid divisor of `channels` if needed. Defaults to 4.
         qkv_bias (bool): If True, add bias to the query, key, value projection.
             Defaults to True.
         padding_mode (str): Padding mode for the depthwise convolution.
@@ -309,7 +384,6 @@ class Attention(nn.Module):
         self,
         channels: int,
         num_heads: int = 8,
-        num_groups: int = 4,
         qkv_bias: bool = True,
         padding_mode: str = "circular"
     ):
@@ -329,28 +403,6 @@ class Attention(nn.Module):
         self.head_dim = channels // num_heads
         self.scale = self.head_dim**-0.5 # Scaling factor for dot products
 
-        # Adjust num_groups for GroupNorm validity
-        if channels < num_groups or num_groups <= 0:
-             # Fallback if num_groups is too large or invalid
-             num_groups = 1
-        if channels % num_groups != 0:
-             # Find the largest valid divisor <= original num_groups
-             valid_groups = [
-                 g for g in range(1, min(channels, num_groups) + 1)
-                 if channels % g == 0
-             ]
-             if not valid_groups:
-                 # Should theoretically not happen if channels > 0, but safeguard
-                 raise ValueError(f"Could not find valid num_groups divisor for channels={channels}")
-             num_groups = max(valid_groups)
-             print(
-                 f"Info: Attention num_groups adjusted to {num_groups} "
-                 f"for channels={channels}"
-             )
-        self.num_groups = num_groups
-
-        # Layers
-        self.norm = nn.GroupNorm(self.num_groups, channels)
         # Project input to Q, K, V tensors
         self.to_qkv_3 = DConv(channels, channels * 3, kernel_size=3, padding=1, bias=qkv_bias,
                                padding_mode=padding_mode)
@@ -371,12 +423,9 @@ class Attention(nn.Module):
         B, C, H, W = x.shape
         residual = x # Store for residual connection
 
-        # Normalize input
-        x_norm = self.norm(x)
-
         # Generate Q, K, V and split them
         # qkv shape: (B, C*3, H, W) -> three tensors of shape (B, C, H, W)
-        qkv = self.to_qkv_3(x_norm) 
+        qkv = self.to_qkv_3(x)
         qkv = qkv.chunk(3, dim=1)
 
         # Reshape Q, K, V for multi-head attention calculation
@@ -538,83 +587,6 @@ class Mlp(nn.Module):
 
 
 # ==============================================================================
-# Module: ECA_block (Efficient Channel Attention Block)
-# ==============================================================================
-
-class ECA_block(nn.Module):
-    """Efficient Channel Attention (ECA) block.
-
-    This module implements the ECA mechanism as described in:
-    "ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks"
-    (https://arxiv.org/abs/1910.03151).
-
-    The ECA block adaptively selects a one-dimensional convolution kernel size
-    based on the number of input channels to capture cross-channel interaction
-    without dimensionality reduction.
-
-    Args:
-        channel (int): Number of input channels.
-        b (int, optional): Bias term for kernel size calculation. Defaults to 1.
-        gamma (int, optional): Scaling parameter for kernel size calculation. Defaults to 2.
-
-    Attributes:
-        avg_pool (nn.AdaptiveAvgPool2d): Global average pooling layer.
-        conv (nn.Conv1d): 1D convolution for adaptive channel attention.
-        sigmoid (nn.Sigmoid): Sigmoid activation for generating attention weights.
-    """
-    def __init__(self, channel: int, b: int = 1, gamma: int = 2):
-        super().__init__()
-        # Compute adaptive kernel size: k = |log2(C)/γ + b|
-        kernel_size = int(abs((math.log(channel, 2) + b) / gamma))
-        # Ensure the kernel size is odd (for symmetric padding)
-        kernel_size = kernel_size if (kernel_size % 2 == 1) else (kernel_size + 1)
-
-        # Global spatial information aggregation: output size is (batch, channel, 1, 1)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # 1D convolution across the channel dimension to capture local cross-channel interactions
-        self.conv = nn.Conv1d(
-            in_channels=1,
-            out_channels=1,
-            kernel_size=kernel_size,
-            padding=(kernel_size - 1) // 2,
-            bias=False
-        )
-        # Sigmoid activation to produce attention weights in [0, 1]
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass for the ECA block.
-
-        Args:
-            x (torch.Tensor): Input feature map of shape (batch, channel, height, width).
-
-        Returns:
-            torch.Tensor: Recalibrated feature map with the same shape as input.
-        """
-        # Step 1: Aggregate spatial information for each channel
-        y = self.avg_pool(x)  # shape: (batch, channel, 1, 1)
-
-        # Step 2: Prepare for 1D convolution:
-        #       squeeze last dim -> (batch, channel, 1)
-        #       transpose -> (batch, 1, channel)
-        y = y.squeeze(-1).transpose(-1, -2)
-
-        # Step 3: Apply 1D convolution and restore dimensions:
-        #       convolved -> (batch, 1, channel)
-        #       transpose -> (batch, channel, 1)
-        #       unsqueeze back to 4D -> (batch, channel, 1, 1)
-        y = self.conv(y).transpose(-1, -2).unsqueeze(-1)
-
-        # Step 4: Generate channel-wise attention weights
-        y = self.sigmoid(y)
-
-        # Step 5: Recalibrate input features by channel-wise multiplication
-        out = x * y.expand_as(x)
-
-        return out
-
-
-# ==============================================================================
 # Module: DiResBlock (Diffusion Residual Block)
 # ==============================================================================
 
@@ -691,7 +663,6 @@ class DiResBlock(nn.Module):
         self.attn = Attention(
             channels=in_channels,
             num_heads=num_heads,
-            num_groups=adjusted_num_groups,
             qkv_bias=True,
             padding_mode=padding_mode
         )
@@ -705,21 +676,21 @@ class DiResBlock(nn.Module):
             hidden_features=mlp_hidden_features, # Adjusted hidden features
             out_features=out_channels,
             act_layer=approx_gelu,
+            bias=False,
             drop=dropout,
             padding_mode=padding_mode,
         ) if in_channels > 0 and out_channels > 0 else nn.Identity() # Mlp needs non-zero channels
 
         # ECA blocks for attention and MLP outputs
-        self.eca_attn = ECA_block(channel=in_channels) if in_channels > 0 else nn.Identity()
-        self.eca_mlp = ECA_block(channel=out_channels) if out_channels > 0 else nn.Identity()
+        self.attn_eca = ECA_block(in_channels) if in_channels > 0 else nn.Identity()
 
         # --- Modulation Projection ---
         # Linear layer to project embedding to modulation parameters (shifts, scales, gates)
         # Only compute modulation if channels > 0
         if self.in_channels > 0 or self.out_channels > 0:
-            modulation_out_dim = self.in_channels * 5 + self.out_channels
+            modulation_out_dim = self.in_channels * 4
             self.adaLN_modulation = nn.Sequential(
-                nn.SiLU(), # Activation on the embedding first
+                nn.SiLU(),
                 nn.Linear(emb_dim, modulation_out_dim, bias=True),
             )
             # Zero-initialize the final modulation layer's weights and biases
@@ -733,7 +704,7 @@ class DiResBlock(nn.Module):
         # --- Shortcut Connections ---
         # Main shortcut: Adjusts channels if in_channels != out_channels
         self.conv_shortcut = (
-            nn.Conv2d(in_channels, out_channels, kernel_size=1)
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
             if in_channels != out_channels and in_channels > 0 and out_channels > 0
             else nn.Identity()
         )
@@ -782,9 +753,9 @@ class DiResBlock(nn.Module):
         # (Only if adaLN_modulation exists)
         if self.adaLN_modulation is not None:
             mod_params = self.adaLN_modulation(emb)
-            split_sizes = [self.in_channels] * 5 + [self.out_channels]
+            split_sizes = [self.in_channels] * 4
             try:
-                 shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+                 shift_msa, scale_msa, shift_mlp, scale_mlp = \
                      torch.split(mod_params, split_sizes, dim=1)
             except RuntimeError as e:
                  raise RuntimeError(f"Error splitting modulation parameters (dim={mod_params.shape[-1]}) "
@@ -793,37 +764,30 @@ class DiResBlock(nn.Module):
              # Provide dummy tensors if no modulation (e.g., C_in=0, C_out>0 case, though unlikely used)
              # These won't be used if norm/attn/mlp are Identities, but prevents errors.
              zero_val = torch.zeros(emb.shape[0], self.in_channels, device=x.device)
-             one_val_out = torch.ones(emb.shape[0], self.out_channels, device=x.device) # Gate MLP needs out_channels
-             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp = [zero_val] * 5
-             gate_mlp = one_val_out # Default gate_mlp to 1 if not computed
+             # one_val_out = torch.ones(emb.shape[0], self.out_channels, device=x.device) # Gate MLP needs out_channels
+             shift_msa, scale_msa, shift_mlp, scale_mlp = [zero_val] * 4
 
 
         # --- Attention Block Path ---
-        residual_attn = x # Residual for attention: (B, C_in, H, W)
+        attn_residual = x # Residual for attention: (B, C_in, H, W)
         x_norm1 = self.norm1(x) # Normalize: (B, C_in, H, W)
         # Modulate with shift_msa, scale_msa (both B, C_in)
         x_mod1 = modulate(x_norm1, shift_msa, scale_msa)
         # Apply attention
         x_attn = self.attn(x_mod1) # (B, C_in, H, W)
         # Apply ECA attention block
-        x_attn = self.eca_attn(x_attn)
-        # Apply gating (gate_msa shape B, C_in) and add residual
-        # Need unsqueeze for spatial broadcast
-        x = residual_attn + gate_msa.unsqueeze(-1).unsqueeze(-1) * x_attn
+        x_attn = self.attn_eca(x_attn)
+        x = attn_residual + x_attn
 
         # --- MLP Block Path ---
         # Residual for MLP path, potentially projected if channels changed
-        residual_mlp = self.mlp_block_res_proj(x) # (B, C_out, H, W)
+        mlp_residual = self.mlp_block_res_proj(x) # (B, C_out, H, W)
         x_norm2 = self.norm2(x) # Normalize: (B, C_in, H, W)
         # Modulate with shift_mlp, scale_mlp (both B, C_in)
         x_mod2 = modulate(x_norm2, shift_mlp, scale_mlp)
         # Apply MLP (changes channels C_in -> C_out)
         x_mlp = self.mlp(x_mod2) # (B, C_out, H, W)
-        # Apply ECA MLP block
-        x_mlp = self.eca_mlp(x_mlp)
-        # Apply gating (gate_mlp shape B, C_out) and add residual
-        # Need unsqueeze for spatial broadcast
-        x = residual_mlp + gate_mlp.unsqueeze(-1).unsqueeze(-1) * x_mlp
+        x = mlp_residual + x_mlp
 
         # --- Final Output ---
         # Add the main shortcut connection
@@ -1592,7 +1556,7 @@ if __name__ == "__main__":
         attn_ch = helper_C_in
         attn_heads = 4
         attn_groups = 4
-        attention = Attention(channels=attn_ch, num_heads=attn_heads, num_groups=attn_groups).to(device)
+        attention = Attention(channels=attn_ch, num_heads=attn_heads).to(device)
         x = torch.randn(helper_test_B, attn_ch, helper_H // 2, helper_W // 2, device=device)
         output = attention(x)
         assert output.shape == x.shape, f"Attention shape mismatch: {output.shape}"
