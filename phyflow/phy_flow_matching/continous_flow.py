@@ -483,7 +483,8 @@ class CFMExecutor:
         data: Tensor,
         label: Tensor,
         prob_path: AffineProbPath,
-        gradient_accumulation_steps: int = 1
+        gradient_accumulation_steps: int = 1,
+        sigma_logit: float = 1.0
     ) -> float:
         """Performs a single training step (forward pass and loss calculation).
 
@@ -497,6 +498,7 @@ class CFMExecutor:
             prob_path: The probability path generator.
             gradient_accumulation_steps: The number of steps over which
                 gradients are accumulated. The loss is scaled by this factor.
+            sigma_logit: Standard deviation for the logit-normal sampler,
 
         Returns:
             The unscaled loss value for this step.
@@ -508,7 +510,7 @@ class CFMExecutor:
 
         # Sample time $t$ using a logit-normal sampler, typically biasing
         # samples towards the ends of the [0,1] interval.
-        t = logit_normal_sampler(shape=(x1.shape[0],), device=self.device)
+        t = logit_normal_sampler(shape=(x1.shape[0],), sigma_logit=sigma_logit, device=self.device)
 
         # Sample $x_t$ and $dx_t/dt$ (target velocity) from the probability path.
         path_sample = prob_path.sample(t=t, x_0=x_0, x_1=x1)
@@ -532,7 +534,9 @@ class CFMExecutor:
         train_loaders: Tuple[DataLoader, ...],
         num_epochs: int,
         gradient_accumulation_steps: int = DEFAULT_GRAD_ACCUM_STEPS,
-        save_every_epochs: int = DEFAULT_SAVE_EVERY_EPOCHS
+        save_every_epochs: int = DEFAULT_SAVE_EVERY_EPOCHS,
+        sigma_logit: float = 1.0,
+        sigma_logit_increase_per_epoch: float = 0.0,
     ) -> None:
         """Runs the main training loop.
 
@@ -548,6 +552,8 @@ class CFMExecutor:
             gradient_accumulation_steps: Number of batches to accumulate
                 gradients over before performing an optimizer step.
             save_every_epochs: Frequency (in epochs) for saving checkpoints.
+            sigma_logit: Initial value for the logit-normal sampler's standard deviation.
+            sigma_logit_increase_per_epoch: Amount to increase the `sigma_logit`
 
         Raises:
             ValueError: If `gradient_accumulation_steps`, `num_epochs`, or
@@ -610,6 +616,11 @@ class CFMExecutor:
         if self.starting_epoch == 0:
             self.epoch_losses = []
 
+        logger.info(
+            f"Initial sigma_logit set to {sigma_logit:.4f}. "
+            "This controls the sampling distribution for time t."
+        )
+
         # --- Main Training Loop ---
         for epoch in range(self.starting_epoch, num_epochs):
             epoch_start_time = time.time()
@@ -619,6 +630,17 @@ class CFMExecutor:
             processed_batches_in_accum_cycle = 0
             optimizer_steps_in_epoch = 0
             last_clip_value_used = None
+            if epoch > 0: # Increase sigma_logit after the first epoch
+                if sigma_logit_increase_per_epoch > 0:
+                    sigma_logit += sigma_logit_increase_per_epoch
+                    logger.info(
+                        f"Increasing sigma_logit by {sigma_logit_increase_per_epoch:.4f} "
+                        f"for this epoch. New sigma_logit: {sigma_logit:.4f}"
+                    )
+                else:
+                    logger.info(
+                        "Keeping sigma_logit = 1 for this epoch."
+                    )
 
             # Create a batch iterator that randomly cycles through dataloaders
             batch_iterator = multi_dataloader_random_cycle(
@@ -641,7 +663,11 @@ class CFMExecutor:
                     label_batch = torch.zeros(data_batch.shape[0], dtype=torch.long)
 
                 step_loss = self._train_step(
-                    data_batch, label_batch, prob_path, gradient_accumulation_steps
+                    data_batch,
+                    label_batch,
+                    prob_path,
+                    gradient_accumulation_steps,
+                    sigma_logit=sigma_logit
                 )
                 running_epoch_loss += step_loss
                 processed_batches_in_epoch += 1
