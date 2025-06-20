@@ -1271,7 +1271,7 @@ class DiResUnet(nn.Module):
         ) if final_decoder_channels > 0 and out_channels >= 0 else nn.Identity() # Allow 0 out_channels
 
 
-    def forward(self, x: Tensor, time: Tensor, conditions: Optional[Sequence[Tensor]] = None) -> Tensor:
+    def forward(self, x: Tensor, time: Tensor, conditions: Optional[Sequence[Tensor]] = None, **kwargs) -> Tensor:
         """Forward pass of the DiResUnet.
 
         Args:
