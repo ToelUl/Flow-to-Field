@@ -3,6 +3,7 @@ from .monte_carlo import XYModel, IsingModel, PottsModel, MCDataset, MCDataGener
 from .phy_flow_matching import (
     DiResUnet,
     CFMWrapper,
+    GenerativeSlidingWindowWrapper,
     logit_normal_sampler,
     timestep_scheduler,
     RandomRoll,
@@ -23,6 +24,7 @@ __all__ = [
     'MCDataGenerator',
     'DiResUnet',
     'CFMWrapper',
+    'GenerativeSlidingWindowWrapper',
     'logit_normal_sampler',
     'timestep_scheduler',
     'RandomRoll',
