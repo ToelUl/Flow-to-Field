@@ -53,8 +53,10 @@ class Heun3Solver(nn.Module):
         Returns:
             The solution tensor at the final time step specified in `t_span`.
         """
+        model.eval()
+
         if not isinstance(t_span, torch.Tensor):
-            t_span = torch.tensor(t_span, device=x.device, dtype=x.dtype)
+            t_span = torch.tensor(t_span, device=x.device, dtype=torch.float32)
 
         # Clone the input tensor to avoid modifying it in place.
         x_current = x.clone()
@@ -66,30 +68,23 @@ class Heun3Solver(nn.Module):
             t_current = t_span[i]
             t_next = t_span[i + 1]
 
-            # Create a batch-wise time tensor for the model.
-            t_batch = torch.full((x_current.shape[0],),
-                                 t_current,
-                                 device=x_current.device,
-                                 dtype=x_current.dtype)
-
             h = t_next - t_current
 
             # Step 1: Calculate k1.
+            t_batch = t_current.expand(x_current.shape[0])
             k1 = model(x_current, t_batch, conditions=conditions)
 
             # Step 2: Calculate k2.
             # Reuse x_intermediate to calculate y + (h/3) * k1.
             torch.add(x_current, k1, alpha=h / 3.0, out=x_intermediate)
-            t_k2 = t_current + h / 3.0
-            t_batch.fill_(t_k2)
-            k2 = model(x_intermediate, t_batch, conditions=conditions)
+            t_k2 = (t_current + h / 3.0).expand(x_current.shape[0])
+            k2 = model(x_intermediate, t_k2, conditions=conditions)
 
             # Step 3: Calculate k3.
             # Reuse x_intermediate to calculate y + (2h/3) * k2.
             torch.add(x_current, k2, alpha=2.0 * h / 3.0, out=x_intermediate)
-            t_k3 = t_current + 2.0 * h / 3.0
-            t_batch.fill_(t_k3)
-            k3 = model(x_intermediate, t_batch, conditions=conditions)
+            t_k3 = (t_current + 2.0 * h / 3.0).expand(x_current.shape[0])
+            k3 = model(x_intermediate, t_k3, conditions=conditions)
 
             # Step 4: Final update using an in-place operation.
             # x_current += (h/4) * (k1 + 3*k3)
@@ -162,7 +157,7 @@ def main():
 
     # Define a non-uniform time span for integration from t=1 to t=0.
     # A power-law spacing concentrates steps near t=0.
-    t_span = torch.linspace(1.0, 0.0, num_steps, device=device).pow(2)
+    t_span = torch.linspace(0.0, 1.0, num_steps, device=device).pow(2)
 
     print(f"\nModel: {_DummyVectorField.__name__}")
     print(f"Input shape: {initial_noise.shape}")
