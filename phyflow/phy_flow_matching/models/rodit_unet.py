@@ -1,6 +1,6 @@
 import math
 from typing import Optional, Sequence, Tuple
-import traceback
+import unittest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,26 +51,26 @@ class SinusoidalPosEmb(nn.Module):
     diffusion models.
 
     Attributes:
-        embedding_dims: The dimension of the embedding vector. It's enforced
+        embedding_dim: The dimension of the embedding vector. It's enforced
             to be an even number.
         max_period: The maximum period of the sinusoidal functions.
     """
 
-    def __init__(self, embedding_dims: int, max_period: int = 10000):
+    def __init__(self, embedding_dim: int, max_period: int = 10000):
         """Initializes the SinusoidalPosEmb module.
 
         Args:
-            embedding_dims: The desired dimension of the embedding. If odd, it
+            embedding_dim: The desired dimension of the embedding. If odd, it
                 will be incremented by 1 to make it even.
             max_period: The maximum period for the sine and cosine functions.
         """
         super().__init__()
-        if not isinstance(embedding_dims, int) or embedding_dims <= 0:
-            raise ValueError(f"embedding_dims must be a positive integer, got {embedding_dims}")
+        if not isinstance(embedding_dim, int) or embedding_dim <= 0:
+            raise ValueError(f"embedding_dim must be a positive integer, got {embedding_dim}")
         # Ensure the embedding dimension is even
-        if embedding_dims % 2 != 0:
-            embedding_dims += 1
-        self.embedding_dims = embedding_dims
+        if embedding_dim % 2 != 0:
+            embedding_dim += 1
+        self.embedding_dim = embedding_dim
         self.max_period = max_period
 
     def forward(self, x: Tensor) -> Tensor:
@@ -81,12 +81,12 @@ class SinusoidalPosEmb(nn.Module):
                be flattened.
 
         Returns:
-            A 2D tensor of shape (B, embedding_dims) containing the
+            A 2D tensor of shape (B, embedding_dim) containing the
             positional embeddings.
         """
         if x.ndim != 1:
             x = x.flatten()
-        half_dim = self.embedding_dims // 2
+        half_dim = self.embedding_dim // 2
         freqs = torch.exp(
             -math.log(self.max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32) / half_dim
         ).to(x.device)
@@ -419,13 +419,12 @@ class ConditionalSAWithRoPE(nn.Module):
     This module takes a sequence of embeddings (e.g., time, and other
     conditions), treats them as a sequence, and applies self-attention with
     Rotary Positional Embeddings (RoPE). This allows the embeddings to
-    interact and create a context-aware fusion. The final output is the
-    processed representation of the first token in the sequence, which acts
-    like a [CLS] token.
+    interact and create a context-aware fusion.
 
     Attributes:
         dim (int): The feature dimension of the embeddings.
-        norm (nn.LayerNorm): Pre-attention layer normalization.
+        input-projection (nn.Linear): A linear layer to project the input
+        norm (nn.RMSNorm): Pre-attention layer normalization.
         qkv_projection (nn.Linear): The layer to project the input sequence
             to Q, K, V.
         rope (RotaryEmbedding1D): The 1D rotary embedding module to encode the
@@ -444,7 +443,8 @@ class ConditionalSAWithRoPE(nn.Module):
         super().__init__()
         self.dim = dim
         self.scale = dim ** -0.5
-
+        self.input_projection = nn.Linear(dim, dim)
+        self.norm = nn.RMSNorm(dim, eps=1e-6)
         self.qkv_projection = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.rope = RotaryEmbedding1D(dim=dim)
 
@@ -466,6 +466,12 @@ class ConditionalSAWithRoPE(nn.Module):
         x = torch.stack(embeddings, dim=1)
         residual = x
 
+        # Project the input sequence to a common dimension.
+        x = self.input_projection(x)
+
+        # Normalize the sequence.
+        x = self.norm(x)
+
         # Project to Q, K, V and split.
         q, k, v = self.qkv_projection(x).chunk(3, dim=-1)
 
@@ -481,8 +487,7 @@ class ConditionalSAWithRoPE(nn.Module):
         # Add residual connection.
         processed_sequence = residual + out
 
-        # Return the first token's output, which has gathered context from all others.
-        return processed_sequence[:, 0, :]
+        return processed_sequence.mean(dim=1)
 
 
 class MSAWithRoPE(nn.Module):
@@ -498,7 +503,7 @@ class MSAWithRoPE(nn.Module):
         is_identity (bool): If True, the module acts as an identity function.
             This is true when the input channel count is zero.
         num_heads (int): The number of attention heads.
-        head_dims (int): The dimension of each attention head.
+        head_dim (int): The dimension of each attention head.
         scale (float): The scaling factor for the dot product.
         qkv_projection (nn.Module): The layer to project input to Q, K, V.
         rope (RotaryEmbedding2D): The 2D rotary embedding module.
@@ -524,7 +529,7 @@ class MSAWithRoPE(nn.Module):
 
         Raises:
             AssertionError: If `channels` is not divisible by `num_heads` or if
-                the resulting `head_dims` is not divisible by 4 (a RoPE requirement).
+                the resulting `head_dim` is not divisible by 4 (a RoPE requirement).
         """
         super().__init__()
         if channels <= 0:
@@ -536,11 +541,11 @@ class MSAWithRoPE(nn.Module):
             f"Channels ({channels}) must be divisible by num_heads ({num_heads}).")
 
         self.num_heads = num_heads
-        self.head_dims = channels // self.num_heads
-        self.scale = self.head_dims**-0.5
+        self.head_dim = channels // self.num_heads
+        self.scale = self.head_dim**-0.5
 
-        assert self.head_dims % 4 == 0, (
-            f"Head dimension ({self.head_dims}) must be divisible by 4 for 2D RoPE.")
+        assert self.head_dim % 4 == 0, (
+            f"Head dimension ({self.head_dim}) must be divisible by 4 for 2D RoPE.")
 
         self.qkv_projection = nn.Conv2d(
             in_channels=channels,
@@ -552,7 +557,7 @@ class MSAWithRoPE(nn.Module):
             groups=channels  # Depthwise convolution
         )
 
-        self.rope = RotaryEmbedding2D(dim=self.head_dims, alpha=alpha)
+        self.rope = RotaryEmbedding2D(dim=self.head_dim, alpha=alpha)
 
     def forward(self, x: Tensor) -> Tensor:
         """Defines the forward pass for the attention module.
@@ -573,18 +578,18 @@ class MSAWithRoPE(nn.Module):
         # 1. Project to Q, K, V and reshape for multi-head attention.
         qkv = self.qkv_projection(x).chunk(3, dim=1)
         q, k, v = map(
-            lambda t: t.view(B, self.num_heads, self.head_dims, N).transpose(-1, -2),
+            lambda t: t.view(B, self.num_heads, self.head_dim, N).transpose(-1, -2),
             qkv
-        ) # Shape of q, k, v: (B, num_heads, N, head_dims)
+        ) # Shape of q, k, v: (B, num_heads, N, head_dim)
 
         # 2. Reshape and apply 2D Rotary Positional Embedding to Q and K.
-        # Permute to (B, N, num_heads, head_dims) for RoPE.
+        # Permute to (B, N, num_heads, head_dim) for RoPE.
         q_for_rope = q.permute(0, 2, 1, 3)
         k_for_rope = k.permute(0, 2, 1, 3)
 
         q_rotated, k_rotated = self.rope(q_for_rope, k_for_rope, height=H, width=W)
 
-        # Permute back to (B, num_heads, N, head_dims) for attention.
+        # Permute back to (B, num_heads, N, head_dim) for attention.
         q = q_rotated.permute(0, 2, 1, 3)
         k = k_rotated.permute(0, 2, 1, 3)
 
@@ -625,6 +630,37 @@ class GRN(nn.Module):
         # Normalize the global descriptor
         nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
         # Apply the GRN transformation
+        return self.gamma * (x * nx) + self.beta + x
+
+
+class GRN1D(nn.Module):
+    """Global Response Normalization (GRN) layer for 1D inputs.
+
+    This is a variant of GRN designed for 1D inputs, such as time series or
+    embeddings. It normalizes the input based on its global response.
+
+    Attributes:
+        gamma: A learnable scaling parameter.
+        beta: A learnable shifting parameter.
+        eps: A small value to prevent division by zero.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6):
+        """Initializes the GRN1D module.
+
+        Args:
+            channels: The number of input channels.
+            eps: A small epsilon value for numerical stability. Defaults to 1e-6.
+        """
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, channels))
+        self.beta = nn.Parameter(torch.zeros(1, channels))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Forward pass for the GRN1D module."""
+        gx = torch.norm(x, p=2, dim=-1, keepdim=True)
+        nx = gx / (gx.mean(dim=-1, keepdim=True) + self.eps)
         return self.gamma * (x * nx) + self.beta + x
 
 
@@ -686,6 +722,7 @@ class RoDitBlock(nn.Module):
         eca: Efficient Channel Attention for the attention output.
         norm2: Group normalization before the MLP block.
         mlp: The MLP module.
+        emb_mlp: A small MLP to process the input embedding.
         adaLN_modulation: A linear layer to generate shift and scale parameters
             from the input embedding.
     """
@@ -693,7 +730,7 @@ class RoDitBlock(nn.Module):
     def __init__(
         self,
         channels: int,
-        emb_dims: int,
+        emb_dim: int,
         num_heads: int = 8,
         num_groups: int = 4,
         dropout: float = 0.0,
@@ -704,7 +741,7 @@ class RoDitBlock(nn.Module):
 
         Args:
             channels: Number of input and output channels.
-            emb_dims: Dimension of the input embedding (e.g., time embedding).
+            emb_dim: Dimension of the input embedding (e.g., time embedding).
             num_heads: Number of attention heads.
             num_groups: Number of groups for GroupNorm. Will be adjusted to be a
                 divisor of `channels`.
@@ -724,7 +761,6 @@ class RoDitBlock(nn.Module):
             num_groups = valid_divisors[0] if valid_divisors else 1
 
         self.norm1 = nn.GroupNorm(num_groups, channels, affine=False)
-        # self.attn = MSA(channels, num_heads=num_heads, padding_mode=padding_mode)
         self.attn = MSAWithRoPE(
             channels=channels,
             num_heads=num_heads,
@@ -739,10 +775,18 @@ class RoDitBlock(nn.Module):
             act_layer=lambda: nn.GELU(approximate="tanh"),
             drop=dropout,
         )
-        modulation_dims = channels * 6  # 6 for: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+        self.emb_mlp = nn.Sequential(
+            nn.RMSNorm(emb_dim, eps=1e-6),
+            nn.Linear(emb_dim, 4 * emb_dim),
+            nn.GELU(approximate="tanh"),
+            GRN1D(4 * emb_dim),
+            nn.Linear(4 * emb_dim, emb_dim),
+            nn.Dropout(dropout),
+        )
+        modulation_dim = channels * 6  # 6 for: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(emb_dims, modulation_dims, bias=True)
+            nn.Linear(emb_dim, modulation_dim, bias=True)
         )
         # Initialize the final modulation projection to be zero
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
@@ -753,13 +797,15 @@ class RoDitBlock(nn.Module):
 
         Args:
             x: Input tensor of shape (B, C, H, W).
-            emb: Embedding tensor of shape (B, emb_dims).
+            emb: Embedding tensor of shape (B, emb_dim).
 
         Returns:
             Output tensor of the same shape as `x`.
         """
         if self.is_identity:
             return x
+
+        emb = self.emb_mlp(emb)
 
         # Generate modulation parameters from the embedding
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(emb).chunk(6, dim=1)
@@ -778,9 +824,153 @@ class RoDitBlock(nn.Module):
         return h + gate_mlp.unsqueeze(-1).unsqueeze(-1) * h_mlp
 
 
+class ResnetBlock(nn.Module):
+    """A ResNet-like block with depthwise convolution and ECA."""
+    def __init__(
+            self,
+            channels: int,
+            emb_dim: int,
+            num_groups: int = 4,
+            dropout: float = 0.0,
+            padding_mode: str = "circular",
+    ):
+        """Initializes the ResnetBlock.
+
+        Args:
+            channels: Number of input and output channels.
+            emb_dim: Dimension of the input embedding (e.g., time embedding).
+            num_groups: Number of groups for GroupNorm. Will be adjusted to be a
+                divisor of `channels`.
+            dropout: Dropout rate for the MLP block.
+            padding_mode: Padding mode for convolutions.
+        """
+        super().__init__()
+        self.channels = channels
+        self.is_identity = channels <= 0
+        if self.is_identity:
+            return
+
+        # Ensure num_groups is a valid divisor of channels
+        if channels % num_groups != 0:
+            valid_divisors = [g for g in range(num_groups, 0, -1) if channels % g == 0]
+            num_groups = valid_divisors[0] if valid_divisors else 1
+
+        self.norm1 = nn.GroupNorm(num_groups, channels, affine=False)
+        self.dw_conv = nn.Conv2d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=3,
+            padding=1,
+            padding_mode=padding_mode,
+            groups=channels  # Depthwise convolution
+        )
+        self.eca = ECA(channels)
+        self.norm2 = nn.GroupNorm(num_groups, channels, affine=False)
+        self.mlp = Mlp(
+            channels,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=dropout,
+        )
+        self.emb_mlp = nn.Sequential(
+            nn.RMSNorm(emb_dim, eps=1e-6),
+            nn.Linear(emb_dim, 4 * emb_dim),
+            nn.GELU(approximate="tanh"),
+            GRN1D(4 * emb_dim),
+            nn.Linear(4 * emb_dim, emb_dim),
+            nn.Dropout(dropout),
+        )
+        modulation_dim = channels * 6  # 6 for: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_dim, modulation_dim, bias=True)
+        )
+        # Initialize the final modulation projection to be zero
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+
+    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
+        """Forward pass for the RoDitBlock.
+
+        Args:
+            x: Input tensor of shape (B, C, H, W).
+            emb: Embedding tensor of shape (B, emb_dim).
+
+        Returns:
+            Output tensor of the same shape as `x`.
+        """
+        if self.is_identity:
+            return x
+
+        emb = self.emb_mlp(emb)
+
+        # Generate modulation parameters from the embedding
+        shift_dwc, scale_dwc, gate_dwc, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(emb).chunk(6, dim=1)
+
+        # First residual sub-block (depthwise convolution)
+        h_dwc = self.norm1(x)
+        h_dwc = modulate(h_dwc, shift_dwc, scale_dwc)
+        h_dwc = self.dw_conv(h_dwc)
+        h_dwc = self.eca(h_dwc)
+        h = x + gate_dwc.unsqueeze(-1).unsqueeze(-1) * h_dwc
+
+        # Second residual sub-block (MLP)
+        h_mlp = self.norm2(h)
+        h_mlp = modulate(h_mlp, shift_mlp, scale_mlp)
+        h_mlp = self.mlp(h_mlp)
+        return h + gate_mlp.unsqueeze(-1).unsqueeze(-1) * h_mlp
+
+
 # ==============================================================================
-# Upsampling & Downsampling Modules
+# Downsampling & Upsampling Modules
 # ==============================================================================
+
+class Downsample(nn.Module):
+    """Downsampling layer using a mix of pooling and strided convolution.
+
+    This layer combines features from a strided convolution, average pooling,
+    and max pooling to create a robust downsampled representation.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, padding_mode: str = "circular"):
+        """Initializes the Downsample module.
+
+        Args:
+            in_channels: Number of input channels.
+            out_channels: Number of output channels.
+            padding_mode: Padding mode for the strided convolution.
+        """
+        super().__init__()
+        self.out_channels = out_channels
+        self.is_identity = in_channels == 0 or out_channels == 0
+        if self.is_identity:
+            return
+
+        self.conv_in = nn.Conv2d(
+            in_channels, in_channels,
+            3,
+            stride=2,
+            padding=1,
+            padding_mode=padding_mode,
+            groups=in_channels
+        )
+        self.avg_pool = nn.AvgPool2d(2, stride=2)
+        self.max_pool = nn.MaxPool2d(2, stride=2)
+        # 1x1 convolution to merge the three feature maps
+        self.conv_out = nn.Conv2d(
+            in_channels * 3, out_channels,
+            1,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Forward pass for the Downsample module."""
+        if self.is_identity:
+            B, _, H, W = x.shape
+            new_H, new_W = H // 2, W // 2
+            return torch.zeros((B, 0, new_H, new_W), dtype=x.dtype, device=x.device)
+
+        features = torch.cat([self.conv_in(x), self.avg_pool(x), self.max_pool(x)], dim=1)
+        return self.conv_out(features)
+
 
 class Upsample(nn.Module):
     """Upsampling layer using PixelShuffle.
@@ -836,54 +1026,6 @@ class Upsample(nn.Module):
         return x
 
 
-class Downsample(nn.Module):
-    """Downsampling layer using a mix of pooling and strided convolution.
-
-    This layer combines features from a strided convolution, average pooling,
-    and max pooling to create a robust downsampled representation.
-    """
-
-    def __init__(self, in_channels: int, out_channels: int, padding_mode: str = "circular"):
-        """Initializes the Downsample module.
-
-        Args:
-            in_channels: Number of input channels.
-            out_channels: Number of output channels.
-            padding_mode: Padding mode for the strided convolution.
-        """
-        super().__init__()
-        self.out_channels = out_channels
-        self.is_identity = in_channels == 0 or out_channels == 0
-        if self.is_identity:
-            return
-
-        self.conv_in = nn.Conv2d(
-            in_channels, in_channels,
-            3,
-            stride=2,
-            padding=1,
-            padding_mode=padding_mode,
-            groups=in_channels
-        )
-        self.avg_pool = nn.AvgPool2d(2, stride=2)
-        self.max_pool = nn.MaxPool2d(2, stride=2)
-        # 1x1 convolution to merge the three feature maps
-        self.conv_out = nn.Conv2d(
-            in_channels * 3, out_channels,
-            1,
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass for the Downsample module."""
-        if self.is_identity:
-            B, _, H, W = x.shape
-            new_H, new_W = H // 2, W // 2
-            return torch.zeros((B, 0, new_H, new_W), dtype=x.dtype, device=x.device)
-
-        features = torch.cat([self.conv_in(x), self.avg_pool(x), self.max_pool(x)], dim=1)
-        return self.conv_out(features)
-
-
 # ==============================================================================
 # Main Model: RoDitUnet
 # ==============================================================================
@@ -893,20 +1035,25 @@ class RoDitUnet(nn.Module):
     This model architecture follows the standard U-Net pattern with an encoder,
     a bottleneck, and a decoder with skip connections. It uses RoDitBlock as
     the main building block and supports time and conditional embeddings.
+
+    The `start_attn_level` parameter allows using ResnetBlocks for shallower
+    layers and switching to RoDitBlocks (with self-attention) at deeper levels
+    to balance performance and computational cost.
     """
 
     def __init__(
         self,
         in_channels: int = 1,
         out_channels: int = 1,
-        model_channels: int = 32,
-        channel_mult: Sequence[int] = (1, 2, 4, 8),
-        num_res_blocks: int = 2,
+        model_channels: int = 64,
+        channel_mult: Sequence[int] = (1, 2, 4,),
+        start_attn_level: int = 0,
+        num_blocks: int = 1,
         dropout: float = 0.1,
         num_heads: int = 8,
-        num_groups: int = 4,
+        num_groups: int = 8,
         num_conditions: int = 0,
-        emb_dims: Optional[int] = None,
+        emb_dim: Optional[int] = None,
         padding_mode: str = "circular",
         alpha: float = 1.0
     ):
@@ -918,12 +1065,15 @@ class RoDitUnet(nn.Module):
             model_channels: The base number of channels for the first level of the U-Net.
             channel_mult: A sequence of multipliers for the channel count at each
                 level of the U-Net.
-            num_res_blocks: The number of RoDitBlock at each level.
+            start_attn_level (int): The level index (0-based) at which to start
+                using RoDitBlocks. Layers before this level will use ResnetBlocks.
+                Defaults to 0 (all levels use attention).
+            num_blocks: The number of Backbone Block at each level.
             dropout: The dropout rate used in the RoDitBlock.
             num_heads: The number of attention heads in the RoDitBlock.
             num_groups: The number of groups for GroupNorm in the RoDitBlock.
             num_conditions: The number of conditions.
-            emb_dims: The dimension of the time and conditional embeddings passed to the RoDitBlock.
+            emb_dim: The dimension of the time and conditional embeddings passed to the RoDitBlock.
                 Defaults to `model_channels`.
             padding_mode: The padding mode for all convolutions.
             alpha: The NTK interpolation scaling factor for RoPE. Defaults to 1.0 (no scaling).
@@ -934,29 +1084,34 @@ class RoDitUnet(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.num_levels = len(channel_mult)
+        self.start_attn_level = start_attn_level
 
         # --- Embedding Setup ---
-        emb_dims = emb_dims or model_channels
-        if emb_dims % 2 != 0:
-            emb_dims += 1
-        self.emb_dims = emb_dims
+        emb_dim = emb_dim or model_channels
+        if emb_dim % 2 != 0:
+            emb_dim += 1
+        self.emb_dim = emb_dim
 
-        self.time_embedder = SinusoidalPosEmb(self.emb_dims)
+        self.time_embedder = SinusoidalPosEmb(self.emb_dim)
 
         self.num_conditions = num_conditions
         if self.num_conditions > 0:
-            self.cond_embedders = nn.ModuleList([SinusoidalPosEmb(self.emb_dims) for _ in range(num_conditions)])
-            self.embedding_attention = ConditionalSAWithRoPE(dim=self.emb_dims)
+            self.cond_embedders = nn.ModuleList([SinusoidalPosEmb(self.emb_dim) for _ in range(num_conditions)])
+            self.embedding_attention = ConditionalSAWithRoPE(dim=self.emb_dim)
 
         # --- U-Net Backbone Construction ---
-        block_args = {
-            "emb_dims": self.emb_dims,
-            "num_heads": num_heads,
+        resnet_block_args = {
+            "emb_dim": self.emb_dim,
             "num_groups": num_groups,
             "dropout": dropout,
             "padding_mode": padding_mode,
-            "alpha": alpha
         }
+        rodit_block_args = {
+            **resnet_block_args,
+            "num_heads": num_heads,
+            "alpha": alpha,
+        }
+
         self.conv_in = nn.Conv2d(in_channels, model_channels, 3, padding=1, padding_mode=padding_mode)
 
         # === Encoder ===
@@ -965,8 +1120,16 @@ class RoDitUnet(nn.Module):
         skip_channels = []
         current_ch = model_channels
         for i in range(self.num_levels):
+            if i < self.start_attn_level:
+                Block = ResnetBlock
+                block_args = resnet_block_args
+            else:
+                Block = RoDitBlock
+                block_args = rodit_block_args
+
             self.down_blocks.append(
-                nn.ModuleList([RoDitBlock(channels=current_ch, **block_args) for _ in range(num_res_blocks)]))
+                nn.ModuleList([Block(channels=current_ch, **block_args) for _ in range(num_blocks)]))
+
             skip_channels.append(current_ch)
             if i < self.num_levels - 1:
                 next_ch = model_channels * channel_mult[i]
@@ -975,9 +1138,10 @@ class RoDitUnet(nn.Module):
 
         # === Bottleneck ===
         ch = current_ch  # Channel count at the bottom of the U-Net
+
         self.middle_blocks = nn.ModuleList([
-            RoDitBlock(channels=ch, **block_args),
-            RoDitBlock(channels=ch, **block_args)
+            RoDitBlock(channels=ch, **rodit_block_args),
+            RoDitBlock(channels=ch, **rodit_block_args)
         ])
 
         # === Decoder ===
@@ -1001,9 +1165,16 @@ class RoDitUnet(nn.Module):
             proj_in_ch = target_ch * 2
             self.up_proj_convs.append(nn.Conv2d(proj_in_ch, target_ch, 1))
 
-            # Add the main residual blocks for this level.
+            # Add the main blocks for this level.
+            if i < self.start_attn_level:
+                Block = ResnetBlock
+                block_args = resnet_block_args
+            else:
+                Block = RoDitBlock
+                block_args = rodit_block_args
+
             self.up_blocks.append(
-                nn.ModuleList([RoDitBlock(channels=target_ch, **block_args) for _ in range(num_res_blocks)]))
+                nn.ModuleList([Block(channels=target_ch, **block_args) for _ in range(num_blocks)]))
 
             # Update `ch` for the next iteration (the level above).
             ch = target_ch
@@ -1102,385 +1273,335 @@ class RoDitUnet(nn.Module):
 
 
 # ==============================================================================
-# Test Code for RoDitUnet and Modules
+# Test Suite
 # ==============================================================================
 
-if __name__ == "__main__":
-    print("="*40)
-    print("--- Running RoDitUnet and Module Tests ---")
-    print("="*40)
+class TestHelperFunctions(unittest.TestCase):
+    """Test helper functions like modulate."""
 
-    # --- Environment and Configuration Checks ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    if torch.cuda.is_available():
-        try:
-            print(f"GPU Name: {torch.cuda.get_device_name(0)}")
-        except Exception as e:
-            print(f"Could not get GPU name: {e}")
+    def test_modulate_4d(self):
+        """Test modulate with 4D tensor."""
+        x = torch.randn(2, 16, 8, 8)
+        shift = torch.randn(2, 16)
+        scale = torch.randn(2, 16)
+        output = modulate(x, shift, scale)
+        self.assertEqual(output.shape, x.shape)
+        # Check if modulation was applied (output should not be equal to input)
+        self.assertFalse(torch.allclose(output, x))
 
-    # --- Test Parameters ---
-    BATCH_SIZE = 2
-    TEST_SIZES = [32, 48, 64] # Example sizes (must be divisible by min_divisor)
-    IN_CHANNELS = 3
-    OUT_CHANNELS = 3
-    MODEL_CHANNELS = 32 # Keep small for tests
-    CHANNEL_MULT = (1, 2, 2) # e.g., 3 levels -> 32, 64, 64 channels
-    NUM_LEVELS = len(CHANNEL_MULT)
-    NUM_DOWNSAMPLES = NUM_LEVELS - 1
-    MIN_DIVISOR = 2**NUM_DOWNSAMPLES
-    NUM_RES_BLOCKS = 1 # Fewer blocks for faster testing
-    COND_EMB_DIMS = (64, 16) # Two conditions with different base dims
-    NUM_CONDITIONS = len(COND_EMB_DIMS)
-    # Let time_emb_dim and final_emb_dim default or set explicitly
-    TIME_EMB_DIM = MODEL_CHANNELS * 2 # Example: 64
-    FINAL_EMB_DIM = TIME_EMB_DIM * 4 # Example: 256 (must be positive)
-    NUM_HEADS = 4 # Heads for RoDitBlock Attention
-    NUM_GROUPS = 4 # Base groups for RoDitBlock GroupNorm
-    DROPOUT = 0.05 # Small dropout
+    def test_modulate_2d(self):
+        """Test modulate with 2D tensor."""
+        x = torch.randn(2, 16)
+        shift = torch.randn(2, 16)
+        scale = torch.randn(2, 16)
+        output = modulate(x, shift, scale)
+        self.assertEqual(output.shape, x.shape)
+        self.assertFalse(torch.allclose(output, x))
 
-    print("\n--- Test Configuration ---")
-    print(f"Batch Size: {BATCH_SIZE}")
-    print(f"In Channels: {IN_CHANNELS}, Out Channels: {OUT_CHANNELS}")
-    print(f"Model Channels: {MODEL_CHANNELS}")
-    print(f"Channel Multipliers: {CHANNEL_MULT} ({NUM_LEVELS} levels, {NUM_DOWNSAMPLES} downsamples)")
-    print(f"Min Input Divisor: {MIN_DIVISOR}")
-    print(f"RoDitBlock per Level: {NUM_RES_BLOCKS}")
-    print(f"Conditional Dims: {COND_EMB_DIMS} ({NUM_CONDITIONS} conditions)")
-    print(f"Time Emb Dim (Base): {TIME_EMB_DIM}")
-    print(f"Final Emb Dim (Modulation): {FINAL_EMB_DIM}")
-    print(f"Num Heads: {NUM_HEADS}, Num Groups (Base): {NUM_GROUPS}")
-    print(f"Dropout: {DROPOUT}")
+    def test_modulate_unsupported_dim(self):
+        """Test modulate with unsupported tensor dimension."""
+        with self.assertRaises(ValueError):
+            modulate(torch.randn(2, 16, 8), torch.randn(2, 16), torch.randn(2, 16))
 
-    # Validate test sizes
-    valid_test_sizes = [s for s in TEST_SIZES if s % MIN_DIVISOR == 0 and s > 0]
-    if not valid_test_sizes:
-         raise ValueError(f"None of the TEST_SIZES {TEST_SIZES} are valid (must be positive and divisible by {MIN_DIVISOR})")
-    print(f"\nTesting with valid image sizes: {valid_test_sizes}")
-    if len(valid_test_sizes) < len(TEST_SIZES):
-        print(f"Skipped invalid sizes: {[s for s in TEST_SIZES if s not in valid_test_sizes]}")
 
-    all_tests_passed = True # Track overall test status
+class TestCoreModules(unittest.TestCase):
+    """Tests for core neural network modules."""
 
-    # --- Test Helper Modules Independently ---
-    print("\n" + "="*30)
-    print("--- Testing Helper Modules ---")
-    print("="*30)
-    try:
-        # Re-run provided tests for the building blocks
-        helper_test_B, helper_C_in, helper_C_out, helper_H, helper_W = 2, 32, 64, 16, 16
-        helper_emb_dim = 128
-        print(f"Helper Test Params: B={helper_test_B}, C_in={helper_C_in}, C_out={helper_C_out}, H={helper_H}, W={helper_W}, EmbDim={helper_emb_dim}")
+    def setUp(self):
+        """Set up common variables for tests."""
+        self.batch_size = 2
+        self.channels = 32
+        self.height = 16
+        self.width = 16
+        self.emb_dim = 64
+        self.seq_len = 10
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Test modulate
-        print("\nTesting modulate...")
-        x_4d = torch.randn(helper_test_B, helper_C_in, helper_H, helper_W, device=device)
-        shift_4d = torch.randn(helper_test_B, helper_C_in, device=device)
-        scale_4d = torch.randn(helper_test_B, helper_C_in, device=device)
-        out_4d = modulate(x_4d, shift_4d, scale_4d)
-        assert out_4d.shape == x_4d.shape, f"Modulate 4D shape mismatch: {out_4d.shape} vs {x_4d.shape}"
-        print("✅ modulate(4D) PASSED.")
-        x_2d = torch.randn(helper_test_B, helper_emb_dim, device=device)
-        shift_2d = torch.randn(helper_test_B, helper_emb_dim, device=device)
-        scale_2d = torch.randn(helper_test_B, helper_emb_dim, device=device)
-        out_2d = modulate(x_2d, shift_2d, scale_2d)
-        assert out_2d.shape == x_2d.shape, f"Modulate 2D shape mismatch: {out_2d.shape} vs {x_2d.shape}"
-        print("✅ modulate(2D) PASSED.")
+    def test_sinusoidal_pos_emb(self):
+        """Test SinusoidalPosEmb module."""
+        emb = SinusoidalPosEmb(self.emb_dim - 1)  # Test odd dimension correction
+        self.assertEqual(emb.embedding_dim, self.emb_dim)
+        x = torch.randint(0, 100, (self.batch_size,)).to(self.device)
+        output = emb(x)
+        self.assertEqual(output.shape, (self.batch_size, self.emb_dim))
+        with self.assertRaises(ValueError):
+            SinusoidalPosEmb(0)
 
-        # Test SinusoidalPosEmb
-        print("\nTesting SinusoidalPosEmb...")
-        max_p = 1000 # Example max_period for test
-        pos_emb = SinusoidalPosEmb(embedding_dims=helper_emb_dim, max_period=max_p).to(device)
-        t_1d = torch.randint(0, max_p, (helper_test_B,), device=device)
-        output_1d = pos_emb(t_1d)
-        assert output_1d.shape == (helper_test_B, helper_emb_dim), f"SinusoidalPosEmb 1D shape mismatch: {output_1d.shape}"
-        print("✅ SinusoidalPosEmb (1D) PASSED.")
-        t_2d = torch.randint(0, max_p, (helper_test_B, 1), device=device)
-        output_2d = pos_emb(t_2d)
-        assert output_2d.shape == (helper_test_B, helper_emb_dim), f"SinusoidalPosEmb 2D shape mismatch: {output_2d.shape}"
-        print("✅ SinusoidalPosEmb (2D) PASSED.")
+    def test_eca(self):
+        """Test ECA module."""
+        eca = ECA(self.channels).to(self.device)
+        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
+        output = eca(x)
+        self.assertEqual(output.shape, x.shape)
 
-        # Test Attention
-        print("\nTesting Attention...")
-        attn_ch = helper_C_in
-        attn_heads = 4
-        attn_groups = 4
-        # attention = MSA(channels=attn_ch, num_heads=attn_heads).to(device)
-        attention = MSAWithRoPE(
-            channels=attn_ch,
-            num_heads=attn_heads,
-            qkv_bias=True,
-            padding_mode="circular"
-        ).to(device)
-        x = torch.randn(helper_test_B, attn_ch, helper_H // 2, helper_W // 2, device=device)
-        output = attention(x)
-        assert output.shape == x.shape, f"Attention shape mismatch: {output.shape}"
-        print("✅ Attention PASSED.")
-        # attention_zero = MSA(channels=0).to(device)
-        attention_zero = MSAWithRoPE(
-            channels=0,
-            num_heads=attn_heads,
-            qkv_bias=True,
-            padding_mode="circular"
-        ).to(device)
-        x_zero = torch.randn(helper_test_B, 0, helper_H, helper_W, device=device)
-        output_zero = attention_zero(x_zero)
-        assert output_zero.shape == x_zero.shape, f"Attention C=0 shape mismatch: {output_zero.shape}"
-        print("✅ Attention (C=0) PASSED.")
+        # Test identity case
+        eca_identity = ECA(0)
+        output_identity = eca_identity(x)
+        self.assertTrue(torch.allclose(x, output_identity))
 
-        # Test Mlp
-        print("\nTesting Mlp...")
-        mlp = Mlp(in_channels=helper_C_in, hidden_channels=helper_C_in * 2, out_channels=helper_C_out).to(device)
-        x = torch.randn(helper_test_B, helper_C_in, helper_H, helper_W, device=device)
+    def test_rotary_embedding_1d(self):
+        """Test RotaryEmbedding1D module."""
+        rope = RotaryEmbedding1D(dim=self.emb_dim).to(self.device)
+        q = torch.randn(self.batch_size, self.seq_len, self.emb_dim).to(self.device)
+        k = torch.randn(self.batch_size, self.seq_len, self.emb_dim).to(self.device)
+        q_rot, k_rot = rope(q, k)
+        self.assertEqual(q_rot.shape, q.shape)
+        self.assertEqual(k_rot.shape, k.shape)
+        self.assertFalse(torch.allclose(q_rot, q))
+        with self.assertRaises(ValueError):
+            RotaryEmbedding1D(dim=31)  # Odd dimension
+
+    def test_rotary_embedding_2d(self):
+        """Test RotaryEmbedding2D module."""
+        dim = 32  # Must be divisible by 4
+        num_heads = 4
+        head_dim = dim // num_heads
+        rope = RotaryEmbedding2D(dim=head_dim, alpha=1.5).to(self.device)
+        q = torch.randn(self.batch_size, self.height * self.width, num_heads, head_dim).to(self.device)
+        k = torch.randn(self.batch_size, self.height * self.width, num_heads, head_dim).to(self.device)
+        q_rot, k_rot = rope(q, k, self.height, self.width)
+        self.assertEqual(q_rot.shape, q.shape)
+        self.assertEqual(k_rot.shape, k.shape)
+        self.assertFalse(torch.allclose(q_rot, q))
+        with self.assertRaises(ValueError):
+            RotaryEmbedding2D(dim=10)  # Not divisible by 4
+
+    def test_conditional_sa_with_rope(self):
+        """Test ConditionalSAWithRoPE module."""
+        cond_sa = ConditionalSAWithRoPE(dim=self.emb_dim).to(self.device)
+        emb1 = torch.randn(self.batch_size, self.emb_dim).to(self.device)
+        emb2 = torch.randn(self.batch_size, self.emb_dim).to(self.device)
+        output = cond_sa([emb1, emb2])
+        self.assertEqual(output.shape, (self.batch_size, self.emb_dim))
+
+    def test_msa_with_rope(self):
+        """Test MSAWithRoPE module."""
+        num_heads = 4
+        msa = MSAWithRoPE(channels=self.channels, num_heads=num_heads).to(self.device)
+        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
+        output = msa(x)
+        self.assertEqual(output.shape, x.shape)
+
+        # Test assertion errors
+        with self.assertRaises(AssertionError):
+            MSAWithRoPE(channels=30, num_heads=4)  # Channels not divisible by heads
+        with self.assertRaises(AssertionError):
+            MSAWithRoPE(channels=32, num_heads=5)  # Head dim not div by 4
+
+    def test_grn(self):
+        """Test GRN module."""
+        grn = GRN(self.channels).to(self.device)
+        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
+
+        # Verify initial state: When gamma and beta are 0, the output should be equal to the input (identity mapping).
+        # This is a check for the correctness of the initialization behavior.
+        initial_output = grn(x)
+        self.assertTrue(torch.allclose(initial_output, x),
+                        "GRN's initial output should be identical to its input due to zero initialization.")
+
+        with torch.no_grad():
+            # 將 gamma 和 beta 的值都設為 1
+            grn.gamma.fill_(1.0)
+            grn.beta.fill_(1.0)
+
+        transformed_output = grn(x)
+        self.assertEqual(transformed_output.shape, x.shape)
+        self.assertFalse(torch.allclose(transformed_output, x),
+                         "After setting parameters to non-zero, GRN should transform the input.")
+
+    def test_grn1d(self):
+        """Test GRN1D module."""
+        grn1d = GRN1D(self.channels).to(self.device)
+        x = torch.randn(self.batch_size, self.channels).to(self.device)
+
+        # Verify initial state: When gamma and beta are 0, the output should be equal to the input (identity mapping).
+        initial_output = grn1d(x)
+        self.assertTrue(torch.allclose(initial_output, x),
+                        "GRN1D's initial output should be identical to its input due to zero initialization.")
+
+        with torch.no_grad():
+            # Set gamma and beta to 1
+            grn1d.gamma.fill_(1.0)
+            grn1d.beta.fill_(1.0)
+
+        transformed_output = grn1d(x)
+        self.assertEqual(transformed_output.shape, x.shape)
+        self.assertFalse(torch.allclose(transformed_output, x),
+                         "After setting parameters to non-zero, GRN1D should transform the input.")
+
+    def test_mlp(self):
+        """Test Mlp module."""
+        mlp = Mlp(in_channels=self.channels, out_channels=self.channels * 2).to(self.device)
+        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
         output = mlp(x)
-        assert output.shape == (helper_test_B, helper_C_out, helper_H, helper_W), f"Mlp shape mismatch: {output.shape}"
-        print("✅ Mlp PASSED.")
-
-        # Test RoDitBlock
-        print("\nTesting RoDitBlock...")
-        di_res_block1 = RoDitBlock(channels=helper_C_in, emb_dims=helper_emb_dim, num_heads=4, num_groups=4).to(device)
-        x1 = torch.randn(helper_test_B, helper_C_in, helper_H // 2, helper_W // 2, device=device)
-        emb1 = torch.randn(helper_test_B, helper_emb_dim, device=device)
-        output1 = di_res_block1(x1, emb1)
-        assert output1.shape == x1.shape, f"RoDitBlock (C_in=C_out) shape mismatch: {output1.shape}"
-        print("✅ RoDitBlock (C_in=C_out) PASSED.")
-        di_res_block2 = RoDitBlock(channels=helper_C_in, emb_dims=helper_emb_dim, num_heads=8, num_groups=8).to(device)
-        x2 = torch.randn(helper_test_B, helper_C_in, helper_H // 2, helper_W // 2, device=device)
-        emb2 = torch.randn(helper_test_B, helper_emb_dim, device=device)
-        output2 = di_res_block2(x2, emb2)
-        # assert output2.shape == (helper_test_B, helper_C_out, helper_H, helper_W), f"RoDitBlock (C_in!=C_out) shape mismatch: {output2.shape}"
-        print("✅ RoDitBlock (C_in!=C_out) PASSED.")
-
-        # Test Upsample
-        # print("\nTesting Upsample...")
-        # up_ch = helper_C_in
-        # upsample_conv = Upsample(in_channels=up_ch, out_channels=up_ch, use_conv=True, scale_factor=2).to(device)
-        # x_up = torch.randn(helper_test_B, up_ch, helper_H // 2, helper_W // 2, device=device)
-        # output_up_conv = upsample_conv(x_up)
-        # assert output_up_conv.shape == (helper_test_B, up_ch, helper_H, helper_W), f"Upsample (conv=True) shape mismatch: {output_up_conv.shape}"
-        # print("✅ Upsample (conv=True) PASSED.")
-        # upsample_zero = Upsample(in_channels=0, out_channels=up_ch, use_conv=True, scale_factor=2).to(device)
-        # x_zero = torch.randn(helper_test_B, 0, helper_H // 2, helper_W // 2, device=device)
-        # output_zero = upsample_zero(x_zero)
-        # assert output_zero.shape == (helper_test_B, 0, helper_H*2, helper_W*2), f"Upsample (C=0) shape mismatch: {output_zero.shape}"
-        # print("✅ Upsample (C=0) PASSED.")
-
-        # Test Downsample
-        # print("\nTesting Downsample...")
-        # down_ch = helper_C_in
-        # downsample_conv = Downsample(in_channels=down_ch, out_channels=down_ch).to(device)
-        # x_down = torch.randn(helper_test_B, down_ch, helper_H, helper_W, device=device)
-        # output_down_conv = downsample_conv(x_down)
-        # assert output_down_conv.shape == (helper_test_B, down_ch, helper_H // 2, helper_W // 2), f"Downsample (conv=True) shape mismatch: {output_down_conv.shape}"
-        # print("✅ Downsample PASSED.")
-        # downsample_zero = Downsample(in_channels=down_ch, out_channels=down_ch).to(device)
-        # x_zero = torch.randn(helper_test_B, 0, helper_H, helper_W, device=device)
-        # output_zero = downsample_zero(x_zero)
-        # assert output_zero.shape == (helper_test_B, 0, helper_H // 2, helper_W // 2), f"Downsample (C=0) shape mismatch: {output_zero.shape}"
-        # print("✅ Downsample (C=0) PASSED.")
-
-        print("\n--- ✅ Helper Module Tests PASSED ---")
-
-    except Exception as e:
-        print("\n--- ❌ FAILED Helper Module Test ---")
-        traceback.print_exc()
-        all_tests_passed = False # Mark overall failure
-
-    # --- Model Instantiation ---
-    print("\n" + "="*30)
-    print("--- Testing RoDitUnet Instantiation ---")
-    print("="*30)
-    try:
-        unet_model = RoDitUnet(
-            in_channels=IN_CHANNELS,
-            out_channels=OUT_CHANNELS,
-            model_channels=MODEL_CHANNELS,
-            channel_mult=CHANNEL_MULT,
-            num_res_blocks=NUM_RES_BLOCKS,
-            num_conditions=len(COND_EMB_DIMS),
-            emb_dims=TIME_EMB_DIM,
-            num_heads=NUM_HEADS,
-            num_groups=NUM_GROUPS,
-            dropout=DROPOUT
-        ).to(device)
-        model_params = sum(p.numel() for p in unet_model.parameters() if p.requires_grad)
-        print(f"\nRoDitUnet Model created successfully.")
-        # print(f"  Use Condition: {unet_model.use_condition}")
-        print(f"  Number of conditions expected: {NUM_CONDITIONS}")
-        # print(f"  Conditional Embedding Dims (adjusted): {unet_model.cond_emb_dims}")
-        # print(f"  Time Embedding Dim (adjusted): {unet_model.time_emb_dim}")
-        # print(f"  Final Modulation Emb Dim: {unet_model.final_emb_dim}")
-        # print(f"  Embedding Max Period (dynamic): {unet_model.embedding_max_period}")
-        print(f"  Trainable Parameters: {model_params/1e6:.2f} M")
-        # if VERBOSE_TEST: print(unet_model)
-
-    except Exception as e:
-        print("\n--- ❌ FAILED TO CREATE RoDitUnet MODEL ---")
-        traceback.print_exc()
-        # If model creation fails, no point running further tests
-        print("\n" + "="*30)
-        print("❌❌❌ OVERALL TEST SUITE FAILED (Model Creation Error) ❌❌❌")
-        print("="*30)
-        exit() # Exit script
-
-    # --- Test Loop for Different Sizes ---
-    print("\n" + "="*30)
-    print("--- Testing RoDitUnet Forward Pass & Gradients ---")
-    print("="*30)
-    for image_size in valid_test_sizes:
-        print(f"\n--- Testing with Image Size: {image_size}x{image_size} ---")
-        test_passed_for_size = True
-
-        # --- Create Dummy Input Data ---
-        try:
-            dummy_image = torch.randn(
-                BATCH_SIZE, IN_CHANNELS, image_size, image_size,
-                device=device
-            )
-            # Time steps (ensure float or long) - use floats for SinusoidalPosEmb
-            dummy_time = torch.rand(BATCH_SIZE, device=device) * 1000 # Random floats 0-1000
-
-            # Create multiple dummy condition tensors (e.g., class labels, values)
-            dummy_conditions = []
-            if unet_model.num_conditions > 0:
-                for i in range(NUM_CONDITIONS):
-                     max_val = 10 if i == 0 else 5 # Example range per condition
-                     cond = torch.randint(0, max_val, (BATCH_SIZE,), device=device).float()
-                     dummy_conditions.append(cond)
-
-            print(f"Input image shape: {dummy_image.shape}")
-            print(f"Input time shape: {dummy_time.shape}")
-            if unet_model.num_conditions > 0:
-                print(f"Input conditions: {len(dummy_conditions)} tensors")
-                for i, cond in enumerate(dummy_conditions):
-                    print(f"  Condition {i} shape: {cond.shape}")
-            else:
-                 print("Input conditions: None (Model configured without conditions)")
+        self.assertEqual(output.shape, (self.batch_size, self.channels * 2, self.height, self.width))
 
 
-        except Exception as e:
-            print(f"\n--- ❌ FAILED to create input data for size {image_size} ---")
-            traceback.print_exc()
-            all_tests_passed = False
-            test_passed_for_size = False
-            continue # Skip to next size
+class TestBuildingBlocks(unittest.TestCase):
+    """Tests for composite blocks like RoDitBlock, Upsample, and Downsample."""
 
-        # --- Perform Forward Pass ---
-        try:
-            print("Performing forward pass...")
-            # Pass the list of condition tensors (or None if not used)
-            forward_conditions = dummy_conditions if unet_model.num_conditions > 0 else None
-            output = unet_model(dummy_image, dummy_time, forward_conditions)
-            print(f"Output shape: {output.shape}")
+    def setUp(self):
+        self.batch_size = 2
+        self.channels = 32
+        self.height = 16
+        self.width = 16
+        self.emb_dim = 64
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            # --- Basic Checks ---
-            expected_shape = (BATCH_SIZE, OUT_CHANNELS, image_size, image_size)
-            assert output.shape == expected_shape, \
-                f"Output shape mismatch! Expected {expected_shape}, got {output.shape}"
-            print("✅ Output shape test PASSED.")
+    def test_rodit_block(self):
+        """Test RoDitBlock module."""
+        block = RoDitBlock(channels=self.channels, emb_dim=self.emb_dim, num_heads=4).to(self.device)
+        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
+        emb = torch.randn(self.batch_size, self.emb_dim).to(self.device)
+        output = block(x, emb)
+        self.assertEqual(output.shape, x.shape)
 
-            # --- Check Gradient Flow ---
-            print("Checking gradient flow...")
-            # Use a scalar loss for backward pass
-            loss = output.abs().mean() # Use absolute mean to avoid potential cancellation
-            loss.backward()
+        # Test identity case
+        block_identity = RoDitBlock(0, 0)
+        output_identity = block_identity(x, emb)
+        self.assertTrue(torch.allclose(x, output_identity))
 
-            # Check if gradients exist for a key parameter (e.g., output conv)
-            grad_sample = None
-            if isinstance(unet_model.conv_out, nn.Conv2d): # Check grad only if it's a real conv layer
-                 grad_sample = unet_model.conv_out.weight.grad
+    def test_resnet_block(self):
+        """Test the ResnetBlock module for correct output shape and identity case."""
+        block = ResnetBlock(channels=self.channels, emb_dim=self.emb_dim).to(self.device)
+        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
+        emb = torch.randn(self.batch_size, self.emb_dim).to(self.device)
+        output = block(x, emb)
+        self.assertEqual(output.shape, x.shape)
 
-            if grad_sample is not None:
-                 grad_norm = torch.norm(grad_sample).item()
-                 print(f"Sample gradient norm (conv_out weight): {grad_norm:.4f}")
-                 assert grad_norm > 1e-9, "Gradients seem to be zero or too small!" # Use a small threshold
-                 print("✅ Gradient check PASSED.")
-            elif not isinstance(unet_model.conv_out, nn.Identity):
-                 print("Warning: conv_out is not Identity, but gradient is None. Check layer usage.")
-                 # This could be an issue, potentially mark test as failed or investigate
-                 # test_passed_for_size = False
-                 # all_tests_passed = False
-            else:
-                 print("Skipping gradient check for conv_out as it is nn.Identity.")
+        # Test identity case when channels are 0
+        block_identity = ResnetBlock(0, 0)
+        output_identity = block_identity(x, emb)
+        self.assertTrue(torch.allclose(x, output_identity))
 
-            # # Check grads for conditional MLPs if they exist
-            # if unet_model.num_conditions > 0 and unet_model.cond_mlps:
-            #      try:
-            #          # Check grad of the last layer's weight in the first conditional MLP
-            #          cond_mlp_grad = unet_model.cond_mlps[0][-1].weight.grad
-            #          if cond_mlp_grad is not None:
-            #              cond_mlp_grad_norm = torch.norm(cond_mlp_grad).item()
-            #              print(f"Sample gradient norm (cond_mlp[0] weight): {cond_mlp_grad_norm:.4f}")
-            #              assert cond_mlp_grad_norm > 1e-9, "Conditional MLP gradients seem too small!"
-            #              print("✅ Conditional MLP gradient check PASSED.")
-            #          else:
-            #              print("Warning: Conditional MLP gradient is None.")
-            #              # test_passed_for_size = False # Optional: fail if cond MLP grad is missing
-            #              # all_tests_passed = False
-            #      except Exception as grad_e:
-            #          print(f"Warning: Could not check conditional MLP gradient: {grad_e}")
+    def test_upsample(self):
+        """Test Upsample module."""
+        scale_factor = 2
+        up = Upsample(in_channels=self.channels, out_channels=self.channels // 2, scale_factor=scale_factor).to(
+            self.device)
+        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
+        output = up(x)
+        expected_shape = (self.batch_size, self.channels // 2, self.height * scale_factor, self.width * scale_factor)
+        self.assertEqual(output.shape, expected_shape)
+
+    def test_downsample(self):
+        """Test Downsample module."""
+        down = Downsample(in_channels=self.channels, out_channels=self.channels * 2).to(self.device)
+        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
+        output = down(x)
+        expected_shape = (self.batch_size, self.channels * 2, self.height // 2, self.width // 2)
+        self.assertEqual(output.shape, expected_shape)
 
 
-            # VERY IMPORTANT: Zero gradients after checking for this size
-            unet_model.zero_grad(set_to_none=True) # Use set_to_none=True for potential memory efficiency
+class TestRoDitUnet(unittest.TestCase):
+    """Comprehensive tests for the full RoDitUnet model."""
 
-        except Exception as e:
-            print(f"\n--- ❌ FAILED Forward Pass or Gradient Check for size {image_size} ---")
-            traceback.print_exc()
-            test_passed_for_size = False
-            all_tests_passed = False
-            # Ensure gradients are zeroed even if an error occurred mid-test
-            try:
-                unet_model.zero_grad(set_to_none=True)
-            except: pass
+    def setUp(self):
+        """Set up common variables for the U-Net tests."""
+        self.batch_size = 2
+        self.in_channels = 3
+        self.out_channels = 3
+        self.height = 32  # Must be divisible by 2^(num_levels-1)
+        self.width = 32
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.base_config = {
+            "in_channels": self.in_channels,
+            "out_channels": self.out_channels,
+            "model_channels": 32,
+            "channel_mult": (1, 2, 4),  # 3 levels (0, 1, 2)
+            "num_blocks": 2,
+            "num_heads": 4,
+        }
 
-        # --- Size Test Summary ---
-        if test_passed_for_size:
-            print(f"--- ✅ Test for size {image_size} PASSED ---")
-        else:
-            print(f"--- ❌ Test for size {image_size} FAILED ---")
+    def test_forward_pass_without_conditions(self):
+        """Test a standard forward pass without any conditions."""
+        model = RoDitUnet(**self.base_config, num_conditions=0).to(self.device)
+        x = torch.randn(self.batch_size, self.in_channels, self.height, self.width).to(self.device)
+        time = torch.randint(0, 100, (self.batch_size,)).to(self.device)
+        output = model(x, time)
+        self.assertEqual(output.shape, (self.batch_size, self.out_channels, self.height, self.width))
 
+    def test_forward_pass_with_conditions(self):
+        """Test a forward pass with conditional inputs and check error handling."""
+        num_cond = 2
+        model = RoDitUnet(**self.base_config, num_conditions=num_cond).to(self.device)
+        x = torch.randn(self.batch_size, self.in_channels, self.height, self.width).to(self.device)
+        time = torch.randint(0, 100, (self.batch_size,)).to(self.device)
+        conditions = [torch.rand(self.batch_size).to(self.device) for _ in range(num_cond)]
 
-    # --- Test UNet without condition ---
-    print("\n" + "="*30)
-    print("--- Testing UNet without Condition ---")
-    print("="*30)
-    try:
-        unet_no_cond = RoDitUnet(
-            in_channels=IN_CHANNELS, out_channels=OUT_CHANNELS, model_channels=MODEL_CHANNELS,
-            channel_mult=CHANNEL_MULT, num_res_blocks=NUM_RES_BLOCKS,
-            # *** Explicitly disable condition by passing None ***
-            emb_dims=TIME_EMB_DIM,
-            num_heads=NUM_HEADS, num_groups=NUM_GROUPS
-        ).to(device)
-        model_params_no_cond = sum(p.numel() for p in unet_no_cond.parameters() if p.requires_grad)
-        print(f"RoDitUnet No Cond created. Params: {model_params_no_cond/1e6:.2f} M")
-        # print(f"  use_condition flag: {unet_no_cond.use_condition}") # Should be False
-        # assert not unet_no_cond.use_condition
+        # Test successful forward pass
+        output = model(x, time, conditions=conditions)
+        self.assertEqual(output.shape, (self.batch_size, self.out_channels, self.height, self.width))
 
-        # Test with the first valid size
-        test_size_no_cond = valid_test_sizes[0]
-        dummy_image_no_cond = torch.randn(BATCH_SIZE, IN_CHANNELS, test_size_no_cond, test_size_no_cond, device=device)
-        dummy_time_no_cond = torch.rand(BATCH_SIZE, device=device) * 1000
+        # Test ValueError with the wrong number of conditions
+        with self.assertRaisesRegex(ValueError, "Expected 2 conditions, but got 1"):
+            model(x, time, conditions=[conditions[0]])
 
-        # *** Pass None for conditions ***
-        print("Performing forward pass without conditions...")
-        output_no_cond = unet_no_cond(dummy_image_no_cond, dummy_time_no_cond, conditions=None)
-        expected_shape_no_cond = (BATCH_SIZE, OUT_CHANNELS, test_size_no_cond, test_size_no_cond)
-        print(f"Output shape (no condition, size {test_size_no_cond}): {output_no_cond.shape}")
-        assert output_no_cond.shape == expected_shape_no_cond, f"Shape mismatch! Expected {expected_shape_no_cond}, got {output_no_cond.shape}"
-        print("✅ UNet without condition test PASSED.")
-    except Exception as e:
-         print(f"\n--- ❌ FAILED Test UNet without Condition ---")
-         traceback.print_exc()
-         all_tests_passed = False # Mark overall failure
+    def test_architecture_based_on_start_attn_level(self):
+        """Verify that `start_attn_level` correctly configures the block types."""
+        num_levels = len(self.base_config["channel_mult"])
 
+        # Define test scenarios: start_level and expected block types for encoder/decoder
+        test_cases = [
+            {
+                "desc": "All levels use attention",
+                "start_attn_level": 0,
+                "expected_block": RoDitBlock,
+            },
+            {
+                "desc": "Attention starts at level 1",
+                "start_attn_level": 1,
+                "expected_block": [ResnetBlock, RoDitBlock, RoDitBlock],
+            },
+            {
+                "desc": "Attention starts at the last level",
+                "start_attn_level": num_levels - 1,
+                "expected_block": [ResnetBlock, ResnetBlock, RoDitBlock],
+            },
+            {
+                "desc": "Only bottleneck uses attention",
+                "start_attn_level": num_levels,
+                "expected_block": ResnetBlock,
+            },
+        ]
 
-    # --- Final Test Summary ---
-    print("\n" + "="*40)
-    print("--- Overall Test Suite Status ---")
-    if all_tests_passed:
-        print("          ✅✅✅ PASSED ✅✅✅          ")
-    else:
-        print("          ❌❌❌ FAILED ❌❌❌          ")
-    print("="*40)
+        for case in test_cases:
+            with self.subTest(desc=case["desc"]):
+                model = RoDitUnet(**self.base_config, start_attn_level=case["start_attn_level"])
+
+                # 1. Verify Encoder (down_blocks)
+                for level_idx, level_blocks in enumerate(model.down_blocks):
+                    expected = case["expected_block"]
+                    BlockType = expected[level_idx] if isinstance(expected, list) else expected
+                    for block in level_blocks:
+                        self.assertIsInstance(block, BlockType,
+                                              f"Down Block at level {level_idx} should be {BlockType.__name__}")
+
+                # 2. Verify Bottleneck (middle_blocks) - should always be RoDitBlock
+                for block in model.middle_blocks:
+                    self.assertIsInstance(block, RoDitBlock,
+                                          "Bottleneck block should always be RoDitBlock")
+
+                # 3. Verify Decoder (up_blocks)
+                # up_blocks are ordered from deep to shallow (level 2, 1, 0)
+                for i, level_blocks in enumerate(model.up_blocks):
+                    level_idx = num_levels - 1 - i  # Convert up_block index to level index
+                    expected = case["expected_block"]
+                    BlockType = expected[level_idx] if isinstance(expected, list) else expected
+                    for block in level_blocks:
+                        self.assertIsInstance(block, BlockType,
+                                              f"Up Block at level {level_idx} should be {BlockType.__name__}")
+
+    def test_input_size_error_handling(self):
+        """Test for ValueError when input spatial dimensions are not valid."""
+        model = RoDitUnet(**self.base_config).to(self.device)
+        # Total downsampling is 2^(num_levels-1) = 2^2 = 4. Input must be divisible by 4.
+        invalid_size = self.height - 1  # 31 is not divisible by 4
+        x = torch.randn(self.batch_size, self.in_channels, invalid_size, invalid_size).to(self.device)
+        time = torch.rand(self.batch_size).to(self.device)
+
+        with self.assertRaisesRegex(ValueError, "must be divisible by the total downsampling factor"):
+            model(x, time)
+
+if __name__ == '__main__':
+    unittest.main(argv=['first-arg-is-ignored'], exit=False)

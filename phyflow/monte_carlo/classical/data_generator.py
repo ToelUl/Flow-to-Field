@@ -101,7 +101,7 @@ class MCDataGenerator(nn.Module):
             tau_pt = pt_interval / pt_prob
             tau = L**2
             tau_eff = (tau_pt * tau) / (tau_pt + tau)
-            factor_therm = 25
+            factor_therm = 10
             factor_decorrelate = 2
             n_therm = int(factor_therm * tau)
             decorrelate = int(factor_decorrelate * tau_eff)
