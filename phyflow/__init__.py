@@ -2,8 +2,8 @@ from .utils import load_image_pil, display_image_pil, create_directory, check_mo
 from .monte_carlo import XYModel, IsingModel, PottsModel, MCDataset, MCDataGenerator
 from .phy_flow_matching import (
     DiResUnet,
+    RoDitUnet,
     CFMWrapper,
-    GenerativeSlidingWindowWrapper,
     logit_normal_sampler,
     timestep_scheduler,
     RandomRoll,
@@ -23,8 +23,8 @@ __all__ = [
     'MCDataset',
     'MCDataGenerator',
     'DiResUnet',
+    'RoDitUnet',
     'CFMWrapper',
-    'GenerativeSlidingWindowWrapper',
     'logit_normal_sampler',
     'timestep_scheduler',
     'RandomRoll',
