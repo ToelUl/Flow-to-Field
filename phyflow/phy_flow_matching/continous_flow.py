@@ -1442,6 +1442,7 @@ class CFMExecutor:
         atol: float = DEFAULT_ATOL,
         rtol: float = DEFAULT_RTOL,
         time_grid: Tensor = DEFAULT_TIME_GRID_FWD,
+        timestep_schedule_factor: float = 0.3,
         do_log: bool = True,
         reshape: bool = True,
         **model_extras
@@ -1465,6 +1466,7 @@ class CFMExecutor:
             atol: Absolute tolerance for adaptive ODE solvers.
             rtol: Relative tolerance for adaptive ODE solvers.
             time_grid: Time grid for the forward ODE solve (e.g., from 0.0 to 1.0).
+            timestep_schedule_factor: Factor for scheduling the time grid.
             do_log: Whether to log the solving process.
             reshape: If True, attempts to reshape the output tensor of
                 generated samples based on `num_samples`.
@@ -1501,7 +1503,10 @@ class CFMExecutor:
 
         # Apply timestep scheduling for sampling (e.g., variance exploding schedule)
         # 'a=0.3' is a hyperparameter for this specific scheduler, may differ from likelihood's 'a'
-        time_grid_scheduled_for_ode = timestep_scheduler(time_grid_ode, a=0.3)
+        time_grid_scheduled_for_ode = timestep_scheduler(
+            time_grid_ode,
+            a=timestep_schedule_factor
+        )
         if do_log:
             logger.info(f"  Time Grid (Scheduled for ODE): {time_grid_scheduled_for_ode.tolist()}")
 
