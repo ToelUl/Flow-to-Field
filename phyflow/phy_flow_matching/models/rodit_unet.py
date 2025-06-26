@@ -496,8 +496,7 @@ class MSAWithRoPE(nn.Module):
     This module computes self-attention on a 2D feature map. It uses a
     depthwise separable convolution for efficient QKV projection and integrates
     2D Rotary Positional Embedding (RoPE) to provide positional awareness to the
-    attention mechanism. It includes a fallback for older PyTorch versions that
-    do not have `scaled_dot_product_attention`.
+    attention mechanism.
 
     Attributes:
         is_identity (bool): If True, the module acts as an identity function.
@@ -511,7 +510,7 @@ class MSAWithRoPE(nn.Module):
     def __init__(self,
                  channels: int,
                  num_heads: int = 4,
-                 qkv_bias: bool = True,
+                 qkv_bias: bool = False,
                  padding_mode: str = "circular",
                  alpha: float = 1.0
                  ):
@@ -594,7 +593,7 @@ class MSAWithRoPE(nn.Module):
         k = k_rotated.permute(0, 2, 1, 3)
 
         # 3. Compute scaled dot-product attention.
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        out = F.scaled_dot_product_attention(q, k, v)
 
         return x + out.transpose(-1, -2).reshape(B, C, H, W)
 
@@ -666,6 +665,17 @@ class GRN1D(nn.Module):
 
 class Mlp(nn.Module):
     """Multi-Layer Perceptron for spatial features.
+
+    This module implements a simple MLP with two pointwise convolutions,
+    an activation function, and a normalization layer. It is typically used
+    in the U-Net architecture to process spatial features.
+
+    Attributes:
+        pw_conv1: The first pointwise convolution layer.
+        act: The activation function applied after the first convolution.
+        norm2: The normalization layer applied after the activation.
+        pw_conv2: The second pointwise convolution layer.
+        drop: The dropout layer applied after the second convolution.
     """
 
     def __init__(
@@ -711,11 +721,13 @@ class Mlp(nn.Module):
 class RoDitBlock(nn.Module):
     """A Diffusion transformer like convolutional block with rotary embeddings.
 
-    This block forms the main building block of the U-Net. It contains two
-    sub-blocks: a self-attention block and an MLP block. Both are modulated by
-    an input embedding.
+    This block forms the main building block of the U-Net at deeper levels. It
+    contains two sub-blocks: a self-attention block and an MLP block. Both are
+    modulated by an input embedding.
 
     Attributes:
+        channels: Number of input and output channels. If 0, the block acts as
+            an identity function.
         is_identity: If True, the block acts as an identity function.
         norm1: Group normalization before the attention block.
         attn: The multi-head self-attention module.
@@ -762,9 +774,8 @@ class RoDitBlock(nn.Module):
 
         self.norm1 = nn.GroupNorm(num_groups, channels, affine=False)
         self.attn = MSAWithRoPE(
-            channels=channels,
+            channels=self.channels,
             num_heads=num_heads,
-            qkv_bias=True,
             padding_mode=padding_mode,
             alpha=alpha,
         )
@@ -825,7 +836,26 @@ class RoDitBlock(nn.Module):
 
 
 class ResnetBlock(nn.Module):
-    """A ResNet-like block with depthwise convolution and ECA."""
+    """A ResNet-like block with depthwise convolution and ECA.
+
+    This block is designed for use in diffusion models, combining depthwise
+    convolution, Efficient Channel Attention (ECA), and a multi-layer perceptron
+    (MLP) for feature processing. It supports modulation based on an input
+    embedding, allowing dynamic adjustment of the block's behavior.
+
+    Attributes:
+        channels: Number of input and output channels. If 0, the block acts as
+            an identity function.
+        is_identity: If True, the block acts as an identity function.
+        norm1: Group normalization before the depthwise convolution.
+        dw_conv: Depthwise convolution layer.
+        eca: Efficient Channel Attention for the depthwise convolution output.
+        norm2: Group normalization before the MLP block.
+        mlp: The MLP module.
+        emb_mlp: A small MLP to process the input embedding.
+        adaLN_modulation: A linear layer to generate modulation parameters
+            from the input embedding.
+    """
     def __init__(
             self,
             channels: int,
@@ -929,6 +959,17 @@ class Downsample(nn.Module):
 
     This layer combines features from a strided convolution, average pooling,
     and max pooling to create a robust downsampled representation.
+
+    If the input or output channels are zero, it acts as an identity function,
+    returning an empty tensor with the appropriate spatial dimensions.
+
+    Attributes:
+        out_channels: Number of output channels.
+        is_identity: If True, the module acts as an identity function.
+        conv_in: A depthwise convolution layer to process the input.
+        avg_pool: Average pooling layer for downsampling.
+        max_pool: Max pooling layer for downsampling.
+        conv_out: A 1x1 convolution to merge the feature maps.
     """
 
     def __init__(self, in_channels: int, out_channels: int, padding_mode: str = "circular"):
@@ -976,8 +1017,19 @@ class Upsample(nn.Module):
     """Upsampling layer using PixelShuffle.
 
     This layer first increases the number of channels and then rearranges
-    them into a higher resolution feature map using PixelShuffle. An optional
-    final convolution can refine the features.
+    them into a higher resolution feature map using PixelShuffle.
+    The final convolution can refine the features.
+
+    If the input or output channels are zero, it acts as an identity function,
+    returning an empty tensor with the appropriate spatial dimensions.
+
+    Attributes:
+        out_channels: Number of output channels.
+        scale_factor: The factor by which to increase spatial resolution.
+        is_identity: If True, the module acts as an identity function.
+        conv1: A depthwise convolution layer to increase channels.
+        pixel_shuffle: PixelShuffle layer to rearrange channels into spatial dimensions.
+        conv2: A 1x1 convolution to refine the output features.
     """
 
     def __init__(
@@ -1039,6 +1091,24 @@ class RoDitUnet(nn.Module):
     The `start_attn_level` parameter allows using ResnetBlocks for shallower
     layers and switching to RoDitBlocks (with self-attention) at deeper levels
     to balance performance and computational cost.
+
+    Attributes:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        model_channels: Base number of channels for the first level of the U-Net.
+        channel_mult: A sequence of multipliers for the channel count at each
+            level of the U-Net.
+        start_attn_level: The level index (0-based) at which to start using
+            RoDitBlocks. Layers before this level will use ResnetBlocks.
+        num_blocks: The number of Backbone Block at each level.
+        dropout: The dropout rate used in the RoDitBlock.
+        num_heads: The number of attention heads in the RoDitBlock.
+        num_groups: The number of groups for GroupNorm in the RoDitBlock.
+        num_conditions: The number of conditions (e.g., time embeddings).
+        emb_dim: The dimension of the time and conditional embeddings passed to
+            the RoDitBlock. Defaults to `model_channels`.
+        padding_mode: The padding mode for all convolutions.
+        alpha: The NTK interpolation scaling factor for RoPE. Defaults to 1.0 (no scaling).
     """
 
     def __init__(

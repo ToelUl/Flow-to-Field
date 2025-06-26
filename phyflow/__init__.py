@@ -1,4 +1,13 @@
-from .utils import load_image_pil, display_image_pil, create_directory, check_model, estimate_max_batch_size, clear_cuda_cache
+from .utils import (
+    load_image_pil,
+    display_image_pil,
+    create_directory,
+    count_params_and_flops,
+    profile_model,
+    check_model,
+    estimate_max_batch_size,
+    clear_cuda_cache
+)
 from .monte_carlo import XYModel, IsingModel, PottsModel, MCDataset, MCDataGenerator
 from .phy_flow_matching import (
     DiResUnet,
@@ -14,6 +23,8 @@ __all__ = [
     'load_image_pil',
     'display_image_pil',
     'create_directory',
+    'count_params_and_flops',
+    'profile_model',
     'check_model',
     'estimate_max_batch_size',
     'clear_cuda_cache',

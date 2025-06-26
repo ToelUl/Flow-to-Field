@@ -72,7 +72,7 @@ class MCDataGenerator(nn.Module):
                  ensemble_number: int,
                  device: str = "cuda:0",
                  q: int = None,
-                 n_chains: int = 30) -> None:
+                 n_chains: int = 10) -> None:
         """
         Runs the Monte Carlo simulation and data generation process.
 
@@ -85,6 +85,7 @@ class MCDataGenerator(nn.Module):
                              per temperature.
             device: The device to run the simulation on (e.g., "cuda:0" or "cpu").
             q: Number of states for Potts model (default is None, indicating not used).
+            n_chains: Number of chains to run in parallel (default is 10).
         """
         start_total_time = time.time()
 
