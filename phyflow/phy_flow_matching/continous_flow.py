@@ -1682,7 +1682,7 @@ class CFMExecutor:
         except Exception as e: # pragma: no cover
             logger.error(f"Failed to save checkpoint to {checkpoint_save_path}: {e}")
 
-    def load_checkpoint(self, checkpoint_path: str) -> None:
+    def load_checkpoint(self, checkpoint_path: str, new_ntk_alpha: float=None) -> None:
         """Loads state from a checkpoint file to resume training or for inference.
 
         This method loads the model weights, optimizer state, learning rate
@@ -1691,6 +1691,7 @@ class CFMExecutor:
 
         Args:
             checkpoint_path: Path to the checkpoint file (.pth).
+            new_ntk_alpha: Optional new alpha value for inference. If provided,
 
         Raises:
             FileNotFoundError: If the checkpoint file does not exist.
@@ -1713,7 +1714,29 @@ class CFMExecutor:
             checkpoint = torch.load(load_path, map_location=self.device, weights_only=False)
 
             # --- Load core states ---
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            if new_ntk_alpha is not None and hasattr(self.model, 'middle_blocks'):
+                new_inv_freq_target = self.model.middle_blocks[0].attn.rope.inv_freq_x.clone()
+                logger.info(
+                    f"New alpha for inference: {new_ntk_alpha}"
+                )
+                logger.info(
+                    f"Target 'inv_freq_x' for new alpha: {new_inv_freq_target}"
+                )
+                source_state_dict = checkpoint['model_state_dict']
+                target_state_dict = self.model.state_dict()
+                state_to_load = {}
+                for k, v in source_state_dict.items():
+                    if 'rope.inv_freq_x' not in k and 'rope.inv_freq_y' not in k:
+                        state_to_load[k] = v
+                target_state_dict.update(state_to_load)
+                self.model.load_state_dict(target_state_dict)
+                logger.info("Model state_dict updated and loaded successfully.")
+                logger.info("--- Verifying the results ---")
+                loaded_inv_freq = self.model.middle_blocks[0].attn.rope.inv_freq_x
+                assert torch.equal(new_inv_freq_target, loaded_inv_freq)
+                logger.info("✅ Verification PASSED: 'inv_freq_x' buffer retains the value from the new alpha.")
+            else:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
 
