@@ -313,7 +313,9 @@ class RotaryEmbedding2D(nn.Module):
         # Apply NTK scaling to the base if alpha is not 1.0
         # A larger alpha leads to a larger base, which results in smaller frequencies (longer wavelengths),
         # allowing the model to handle larger positions.
-        scaled_base = self.base * (self.alpha ** (dim_half / (dim_half - 2.0))) if self.alpha != 1.0 else self.base
+        scaled_base = self.base * (
+                self.alpha ** (dim_half / (dim_half - 2.0 + 1e-6))
+        ) if self.alpha != 1.0 and dim_half != 2.0 else self.base
 
         inv_freq = 1.0 / (scaled_base**freqs_for_half)
 
@@ -556,7 +558,7 @@ class MSAWithRoPE(nn.Module):
             groups=channels  # Depthwise convolution
         )
 
-        self.rope = RotaryEmbedding2D(dim=self.head_dim, alpha=alpha)
+        self.rope = RotaryEmbedding2D(dim=self.head_dim, base=channels, alpha=alpha)
 
     def forward(self, x: Tensor) -> Tensor:
         """Defines the forward pass for the attention module.
@@ -1202,7 +1204,7 @@ class RoDitUnet(nn.Module):
 
             skip_channels.append(current_ch)
             if i < self.num_levels - 1:
-                next_ch = model_channels * channel_mult[i]
+                next_ch = model_channels * channel_mult[i+1]
                 self.down_samplers.append(Downsample(in_channels=current_ch, out_channels=next_ch))
                 current_ch = next_ch
 
