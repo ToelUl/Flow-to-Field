@@ -426,6 +426,7 @@ class ConditionalSAWithRoPE(nn.Module):
     Attributes:
         dim (int): The feature dimension of the embeddings.
         input-projection (nn.Linear): A linear layer to project the input
+            sequence to a common dimension.
         norm (nn.RMSNorm): Pre-attention layer normalization.
         qkv_projection (nn.Linear): The layer to project the input sequence
             to Q, K, V.
@@ -1155,6 +1156,19 @@ class RoDitUnet(nn.Module):
             raise ValueError("channel_mult cannot be empty.")
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.model_channels = model_channels
+        self.channel_mult = channel_mult
+        if start_attn_level < 0:
+            raise ValueError(f"start_attn_level must be positive, got {start_attn_level}.")
+        self.start_attn_level = start_attn_level
+        if num_blocks <= 0:
+            raise ValueError(f"num_blocks must be positive, got {num_blocks}.")
+        self.num_blocks = num_blocks
+        self.dropout = dropout
+        self.num_heads = num_heads
+        self.num_groups = num_groups
+        self.padding_mode = padding_mode
+        self.alpha = alpha
         self.num_levels = len(channel_mult)
         self.start_attn_level = start_attn_level
 
