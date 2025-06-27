@@ -1,6 +1,7 @@
 import os
 from typing import Tuple, Dict, Any
 
+import copy
 import torch
 from torch import nn, Tensor
 from thop import profile
@@ -82,9 +83,10 @@ def profile_model(
     else:
         inputs = (x, time)
 
+    profiling_model = copy.deepcopy(model)
     # Profile parameters and FLOPs, suppressing THOP stdout
     with redirect_stdout(open(os.devnull, 'w')):
-        flops, params = profile(model, inputs=inputs, verbose=False)
+        flops, params = profile(profiling_model, inputs=inputs, verbose=False)
 
     # Convert to human-readable units
     params_m = params / 1e6
