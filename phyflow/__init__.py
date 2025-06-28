@@ -5,6 +5,9 @@ from .utils import (
     count_params_and_flops,
     profile_model,
     check_model,
+    lock_all_convolutional_layers,
+    lock_all_non_convolutional_layers,
+    unlock_all_layers,
     estimate_max_batch_size,
     clear_cuda_cache
 )
@@ -16,6 +19,7 @@ from .phy_flow_matching import (
     logit_normal_sampler,
     timestep_scheduler,
     RandomRoll,
+    RandomGlobalRotation,
     CFMExecutor,
 )
 
@@ -26,6 +30,9 @@ __all__ = [
     'count_params_and_flops',
     'profile_model',
     'check_model',
+    'lock_all_convolutional_layers',
+    'lock_all_non_convolutional_layers',
+    'unlock_all_layers',
     'estimate_max_batch_size',
     'clear_cuda_cache',
     'XYModel',
@@ -39,5 +46,6 @@ __all__ = [
     'logit_normal_sampler',
     'timestep_scheduler',
     'RandomRoll',
+    'RandomGlobalRotation',
     'CFMExecutor',
 ]

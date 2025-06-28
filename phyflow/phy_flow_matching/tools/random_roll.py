@@ -25,7 +25,7 @@ class RandomRoll(nn.Module):
     Example:
         >>> aug = RandomRoll(max_shift=(5, 10), p=0.5)
         >>> x = torch.randn(8, 3, 224, 224, device='cuda')
-        >>> y = aug(x)  # 50% 機率對 batch 中每張圖做隨機平移
+        >>> y = aug(x)  # Randomly rolls the input tensor with 50% probability
     """
 
     def __init__(
@@ -57,8 +57,14 @@ class RandomRoll(nn.Module):
 
         dy = random.randint(-self.max_shift_y, self.max_shift_y)
         dx = random.randint(-self.max_shift_x, self.max_shift_x)
-        # dims -2, -1 對應 H, W
+
         return torch.roll(img, shifts=(dy, dx), dims=(-2, -1))
+
+    def __repr__(self) -> str:
+        """
+        Provides a string representation of the transform.
+        """
+        return f"{self.__class__.__name__}()"
 
 
 def _validate_random_roll() -> None:
