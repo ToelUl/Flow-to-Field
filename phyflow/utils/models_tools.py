@@ -108,3 +108,28 @@ def check_model(model: torch.nn.Module):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(model)
     print(f"Total number of trainable parameters: {trainable_params/1e6:.2f} M")
+
+
+def lock_all_convolutional_layers(model: nn.Module) -> None:
+    """Freezes all convolutional layers in a given model for fine-tuning."""
+    for module in model.modules():
+        if isinstance(module, (nn.Conv1d, nn.Conv2d)):
+            for param in module.parameters():
+                param.requires_grad = False
+
+
+def lock_all_non_convolutional_layers(model: nn.Module) -> None:
+    """Freezes all non-convolutional layers in a model for fine-tuning."""
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for module in model.modules():
+        if isinstance(module, (nn.Conv1d, nn.Conv2d)):
+            for param in module.parameters():
+                param.requires_grad = True
+
+
+def unlock_all_layers(model: nn.Module) -> None:
+    """Unfreezes all layers in a model."""
+    for param in model.parameters():
+        param.requires_grad = True
