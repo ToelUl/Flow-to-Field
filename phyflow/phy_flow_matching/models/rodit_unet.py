@@ -412,85 +412,143 @@ class RotaryEmbedding2D(nn.Module):
         self._update_cache(height, width, q.device)
         rotated_q = self._apply_rotary_embedding(q)
         rotated_k = self._apply_rotary_embedding(k)
+
         return rotated_q, rotated_k
 
 
-class ConditionalSAWithRoPE(nn.Module):
-    """A Single-Head Self-Attention block for fusing conditional embeddings.
+class ConditionalMSAWithRoPE(nn.Module):
+    """A Multi-Head Self-Attention block for fusing conditional embeddings
+    with RoPE.
 
-    This module takes a sequence of embeddings (e.g., time, and other
-    conditions), treats them as a sequence, and applies self-attention with
-    Rotary Positional Embeddings (RoPE). This allows the embeddings to
-    interact and create a context-aware fusion.
+    This module takes a sequence of embeddings, treats them as a sequence, and
+    applies multi-head self-attention with Rotary Positional Embeddings (RoPE).
+    This allows the embeddings to interact and create a context-aware fusion
+    across different representation subspaces.
 
     Attributes:
         dim (int): The feature dimension of the embeddings.
-        input-projection (nn.Linear): A linear layer to project the input
-            sequence to a common dimension.
+        num_heads (int): The number of attention heads.
+        seq_len (int): The length of the input sequence (number of conditions).
+        head_dim (int): The dimension of each attention head.
+        input_projection (nn.Sequential): Pre-processing MLP for the input.
         norm (nn.RMSNorm): Pre-attention layer normalization.
         qkv_projection (nn.Linear): The layer to project the input sequence
             to Q, K, V.
-        rope (RotaryEmbedding1D): The 1D rotary embedding module to encode the
-            order of conditions.
-        scale (float): The scaling factor for the dot product (1/sqrt(dim)).
+        rope (RotaryEmbedding1D): The 1D rotary embedding module, applied per
+            head.
+        head_combine_proj (nn.Linear): A linear layer to combine the outputs
+            from different heads.
+        seq_combine_proj (nn.Linear): A linear layer to combine the sequence
+            length into a single output.
     """
-    def __init__(self, dim: int, qkv_bias: bool = False):
-        """Initializes the ConditionalSAWithRoPE module.
+
+    def __init__(self, dim: int, num_heads: int, seq_len: int, qkv_bias: bool = False):
+        """Initializes the ConditionalMSAWithRoPE module.
 
         Args:
-            dim (int): The feature dimension of the input and output embeddings.
-                Must be an even number for RoPE compatibility.
+            dim (int): The feature dimension of the input and output. Must be
+                divisible by num_heads.
+            num_heads (int): The number of attention heads.
+            seq_len (int): The length of the input sequence.
             qkv_bias (bool): If True, adds a learnable bias to the QKV
                 projection.
+
+        Raises:
+            ValueError: If `dim` is not divisible by `num_heads`.
         """
         super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(
+                f"Dimension ({dim}) must be divisible by num_heads ({num_heads}).")
+
         self.dim = dim
-        self.scale = dim ** -0.5
-        self.input_projection = nn.Linear(dim, dim)
+        self.num_heads = num_heads
+        self.seq_len = seq_len
+        self.head_dim = dim // num_heads
+
+        # The input projection remains the same
+        self.input_projection = nn.Sequential(
+            nn.Linear(dim, 4 * dim),
+            nn.SiLU(),
+            nn.Linear(4 * dim, dim),
+        )
         self.norm = nn.RMSNorm(dim, eps=1e-6)
+
+        # QKV projection layer is also the same
         self.qkv_projection = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.rope = RotaryEmbedding1D(dim=dim)
+
+        # RoPE is now applied on the head dimension
+        self.rope = RotaryEmbedding1D(dim=self.head_dim)
+
+        # An output projection layer is added to combine heads
+        self.head_combine_proj = nn.Linear(dim, dim)
+
+        # A projection to combine the sequence length into a single output
+        self.seq_combine_proj = nn.Linear(seq_len, 1, bias=False)
 
     def forward(self, embeddings: Sequence[torch.Tensor]) -> torch.Tensor:
-        """Forward pass for the attention block.
+        """Forward pass for the multi-head attention block.
 
         Args:
             embeddings (Sequence[torch.Tensor]): A sequence of embedding
-                tensors. The first tensor is expected to be the primary
-                embedding (e.g., time). Each tensor should have a shape of
-                (Batch, Dim).
+                tensors. Each tensor should have a shape of (Batch, Dim).
 
         Returns:
-            torch.Tensor: An aggregated embedding tensor of shape (Batch, Dim),
-                representing the processed first token of the sequence.
+            torch.Tensor: An aggregated embedding tensor of shape (Batch, Dim).
         """
         # Stack embeddings to form a sequence: (B, S, D)
-        # where S is the number of conditions + 1 (for time).
+        # S is the number of conditions.
         x = torch.stack(embeddings, dim=1)
+        B, S, D = x.shape
         residual = x
 
-        # Project the input sequence to a common dimension.
+        # 1. Pre-processing
         x = self.input_projection(x)
-
-        # Normalize the sequence.
         x = self.norm(x)
 
-        # Project to Q, K, V and split.
-        q, k, v = self.qkv_projection(x).chunk(3, dim=-1)
+        # 2. Project to Q, K, V
+        # (B, S, D) -> (B, S, 3 * D)
+        qkv = self.qkv_projection(x)
 
-        # Apply RoPE to Query and Key to encode position of each condition.
-        q, k = self.rope(q, k)
+        # 3. Reshape for Multi-Head Attention
+        # (B, S, 3 * D) -> (B, S, 3, H, D_h) -> (3, B, H, S, D_h)
+        # where H is num_heads, and D_h is head_dim
+        qkv = qkv.reshape(B, S, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Shape of each: (B, H, S, D_h)
 
-        # Compute scaled dot-product attention.
-        # Add a head dimension for compatibility: (B, S, D) -> (B, 1, S, D)
-        out = F.scaled_dot_product_attention(
-            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), is_causal=False
-        ).squeeze(1)
+        # 4. Apply RoPE to Query and Key
+        # To apply RoPE, we temporarily merge the Batch and Head dimensions
+        q_orig_shape = q.shape
+        k_orig_shape = k.shape
+        q_reshaped = q.reshape(B * self.num_heads, S, self.head_dim)
+        k_reshaped = k.reshape(B * self.num_heads, S, self.head_dim)
 
-        # Add residual connection.
-        processed_sequence = residual + out
+        q_rot, k_rot = self.rope(q_reshaped, k_reshaped)
 
-        return processed_sequence.mean(dim=1)
+        # Reshape back to the original multi-head format
+        q = q_rot.view(q_orig_shape)
+        k = k_rot.view(k_orig_shape)
+
+        # 5. Compute scaled dot-product attention
+        # F.scaled_dot_product_attention handles the multi-head format directly
+        # Input shapes: (B, H, S, D_h). Output shape: (B, H, S, D_h)
+        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
+        # 6. Combine heads
+        # (B, H, S, D_h) -> (B, S, H, D_h) -> (B, S, D)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, S, D)
+
+        # 7. Final projection
+        # (B, S, D) -> (B, S, D)
+        out = self.head_combine_proj(attn_output)
+
+        # 8. Add residual
+        processed_sequence = (residual + out).permute(0, 2, 1)
+
+        # 9. Combine sequence length into a single output
+        processed_sequence = self.seq_combine_proj(processed_sequence)
+
+        return processed_sequence.squeeze(-1)
 
 
 class MSAWithRoPE(nn.Module):
@@ -775,7 +833,7 @@ class RoDitBlock(nn.Module):
             valid_divisors = [g for g in range(num_groups, 0, -1) if channels % g == 0]
             num_groups = valid_divisors[0] if valid_divisors else 1
 
-        self.norm1 = nn.GroupNorm(num_groups, channels, affine=False)
+        self.norm1 = nn.GroupNorm(num_groups, channels, affine=False, eps=1e-6)
         self.attn = MSAWithRoPE(
             channels=self.channels,
             num_heads=num_heads,
@@ -783,7 +841,7 @@ class RoDitBlock(nn.Module):
             alpha=alpha,
         )
         self.eca = ECA(channels)
-        self.norm2 = nn.GroupNorm(num_groups, channels, affine=False)
+        self.norm2 = nn.GroupNorm(num_groups, channels, affine=False, eps=1e-6)
         self.mlp = Mlp(
             channels,
             act_layer=lambda: nn.GELU(approximate="tanh"),
@@ -888,7 +946,7 @@ class ResnetBlock(nn.Module):
             valid_divisors = [g for g in range(num_groups, 0, -1) if channels % g == 0]
             num_groups = valid_divisors[0] if valid_divisors else 1
 
-        self.norm1 = nn.GroupNorm(num_groups, channels, affine=False)
+        self.norm1 = nn.GroupNorm(num_groups, channels, affine=False, eps=1e-6)
         self.dw_conv = nn.Conv2d(
             in_channels=channels,
             out_channels=channels,
@@ -898,7 +956,7 @@ class ResnetBlock(nn.Module):
             groups=channels  # Depthwise convolution
         )
         self.eca = ECA(channels)
-        self.norm2 = nn.GroupNorm(num_groups, channels, affine=False)
+        self.norm2 = nn.GroupNorm(num_groups, channels, affine=False, eps=1e-6)
         self.mlp = Mlp(
             channels,
             act_layer=lambda: nn.GELU(approximate="tanh"),
@@ -1085,22 +1143,36 @@ class Upsample(nn.Module):
 # Main Model: RoDitUnet
 # ==============================================================================
 class RoDitUnet(nn.Module):
-    """Rotary Embedding Diffusion Transformer U-Net (RoDitUnet).
+    """Diffusion Transformer like U-Net with Rotary Embedding.
 
     This model architecture follows the standard U-Net pattern with an encoder,
-    a bottleneck, and a decoder with skip connections. It uses RoDitBlock as
-    the main building block and supports time and conditional embeddings.
+    a bottleneck, and a decoder with skip connections. To significantly improve
+    computational speed and efficiency, this implementation deliberately adopts an
+    "extract-then-expand" design choice. The main blocks at each level process
+    features *before* the downsampling layers expand the channel depth for the
+    next level. This approach markedly reduces the parameter count and computational
+    load, making the model inherently lighter and faster.
 
-    The `start_attn_level` parameter allows using ResnetBlocks for shallower
-    layers and switching to RoDitBlocks (with self-attention) at deeper levels
-    to balance performance and computational cost.
+    It uses RoDitBlock as the main building block and supports time and conditional
+    embeddings. The `start_attn_level` parameter complements the efficiency-focused
+    design by allowing the use of ResnetBlocks for shallower layers and switching to
+    RoDitBlocks (with self-attention) at deeper levels, further balancing performance
+    and computational cost.
 
     Attributes:
         in_channels: Number of input channels.
         out_channels: Number of output channels.
         model_channels: Base number of channels for the first level of the U-Net.
-        channel_mult: A sequence of multipliers for the channel count at each
-            level of the U-Net.
+        downsample_out_ch_mult (Sequence[int]): A sequence of multipliers that defines the
+            output channels for each downsampling layer, which in turn sets the input
+            channels for the *next* level. For example, with `model_channels=32` and
+            `downsample_out_ch_mult=(1, 2, 4)`, the process is as follows:
+            - **Level 0 Blocks** operate on `32` channels.
+            - **Level 0 Downsampler** outputs `32 * 1 = 32` channels.
+            - **Level 1 Blocks** operate on `32` channels.
+            - **Level 1 Downsampler** outputs `32 * 2 = 64` channels.
+            - **The final element (4)** is for the bottleneck's channel multiplier.
+            Note: The blocks at a given level `i` do *not* operate on `model_channels * downsample_out_ch_mult[i]`.
         start_attn_level: The level index (0-based) at which to start using
             RoDitBlocks. Layers before this level will use ResnetBlocks.
         num_blocks: The number of Backbone Block at each level.
@@ -1118,8 +1190,8 @@ class RoDitUnet(nn.Module):
         self,
         in_channels: int = 1,
         out_channels: int = 1,
-        model_channels: int = 64,
-        channel_mult: Sequence[int] = (1, 2, 4,),
+        model_channels: int = 32,
+        downsample_out_ch_mult: Sequence[int] = (2, 2, 4,),
         start_attn_level: int = 0,
         num_blocks: int = 1,
         dropout: float = 0.1,
@@ -1136,8 +1208,16 @@ class RoDitUnet(nn.Module):
             in_channels: Number of channels in the input tensor.
             out_channels: Number of channels in the output tensor.
             model_channels: The base number of channels for the first level of the U-Net.
-            channel_mult: A sequence of multipliers for the channel count at each
-                level of the U-Net.
+            downsample_out_ch_mult (Sequence[int]): A sequence of multipliers that defines the
+                output channels for each downsampling layer, which in turn sets the input
+                channels for the *next* level. For example, with `model_channels=32` and
+                `downsample_out_ch_mult=(1, 2, 4)`, the process is as follows:
+                - **Level 0 Blocks** operate on `32` channels.
+                - **Level 0 Downsampler** outputs `32 * 1 = 32` channels.
+                - **Level 1 Blocks** operate on `32` channels.
+                - **Level 1 Downsampler** outputs `32 * 2 = 64` channels.
+                - **The final element (4)** is for the bottleneck's channel multiplier.
+                Note: The blocks at a given level `i` do *not* operate on `model_channels * downsample_out_ch_mult[i]`.
             start_attn_level (int): The level index (0-based) at which to start
                 using RoDitBlocks. Layers before this level will use ResnetBlocks.
                 Defaults to 0 (all levels use attention).
@@ -1152,12 +1232,18 @@ class RoDitUnet(nn.Module):
             alpha: The NTK interpolation scaling factor for RoPE. Defaults to 1.0 (no scaling).
         """
         super().__init__()
-        if not channel_mult:
-            raise ValueError("channel_mult cannot be empty.")
+        if len(downsample_out_ch_mult) < 2:
+            raise ValueError(
+                "downsample_out_ch_mult must have at least two elements: "
+                "one for the first encoder/decoder level and one for the bottleneck."
+            )
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.model_channels = model_channels
-        self.channel_mult = channel_mult
+        self.downsample_out_ch_mult = downsample_out_ch_mult
+        self.num_levels = len(downsample_out_ch_mult) - 1
+        self.encoder_channel_mults = downsample_out_ch_mult[:-1]
+        self.bottleneck_channel_mult = downsample_out_ch_mult[-1]
         if start_attn_level < 0:
             raise ValueError(f"start_attn_level must be positive, got {start_attn_level}.")
         self.start_attn_level = start_attn_level
@@ -1169,8 +1255,6 @@ class RoDitUnet(nn.Module):
         self.num_groups = num_groups
         self.padding_mode = padding_mode
         self.alpha = alpha
-        self.num_levels = len(channel_mult)
-        self.start_attn_level = start_attn_level
 
         # --- Embedding Setup ---
         emb_dim = emb_dim or model_channels
@@ -1183,7 +1267,11 @@ class RoDitUnet(nn.Module):
         self.num_conditions = num_conditions
         if self.num_conditions > 0:
             self.cond_embedders = nn.ModuleList([SinusoidalPosEmb(self.emb_dim) for _ in range(num_conditions)])
-            self.embedding_attention = ConditionalSAWithRoPE(dim=self.emb_dim)
+            self.embedding_attention = ConditionalMSAWithRoPE(
+                dim=self.emb_dim,
+                num_heads=num_heads,
+                seq_len=num_conditions+1
+            )
 
         # --- U-Net Backbone Construction ---
         resnet_block_args = {
@@ -1204,8 +1292,20 @@ class RoDitUnet(nn.Module):
         self.down_blocks = nn.ModuleList()
         self.down_samplers = nn.ModuleList()
         skip_channels = []
-        current_ch = model_channels
+
+        # Pre-build a clear channel schedule
+        # e.g., model_channels=64, downsample_out_ch_mult=(1, 2, 4) yields ch_schedule=[64, 64, 128, 256]
+        ch_schedule = [model_channels] + [model_channels * m for m in self.encoder_channel_mults]
+
+        # Iterate over each encoder level
         for i in range(self.num_levels):
+            # Channels for the blocks at the CURRENT level, which is the output from the PREVIOUS level's downsampler.
+            current_level_channels = ch_schedule[i]
+
+            # Channels for the NEXT level, which will be the output of THIS level's downsampler.
+            next_level_channels = ch_schedule[i + 1]
+
+            # Determine whether to use ResnetBlock or RoDitBlock
             if i < self.start_attn_level:
                 Block = ResnetBlock
                 block_args = resnet_block_args
@@ -1213,22 +1313,31 @@ class RoDitUnet(nn.Module):
                 Block = RoDitBlock
                 block_args = rodit_block_args
 
+            # Build the blocks for the current level. They operate on `current_level_channels`.
             self.down_blocks.append(
-                nn.ModuleList([Block(channels=current_ch, **block_args) for _ in range(num_blocks)]))
+                nn.ModuleList([Block(channels=current_level_channels, **block_args) for _ in range(num_blocks)])
+            )
 
-            skip_channels.append(current_ch)
-            if i < self.num_levels - 1:
-                next_ch = model_channels * channel_mult[i+1]
-                self.down_samplers.append(Downsample(in_channels=current_ch, out_channels=next_ch))
-                current_ch = next_ch
+            # Store `current_level_channels` for the skip connection.
+            skip_channels.append(current_level_channels)
+
+            # Create a downsampler to transition from `current_level_channels` to `next_level_channels`.
+            self.down_samplers.append(Downsample(in_channels=current_level_channels, out_channels=next_level_channels))
+
+        # Update channels entering the bottleneck
+        bottleneck_input_ch = ch_schedule[-1]
 
         # === Bottleneck ===
-        ch = current_ch  # Channel count at the bottom of the U-Net
-
+        bottleneck_ch = model_channels * self.bottleneck_channel_mult
+        self.to_bottleneck = nn.Sequential(
+            nn.Conv2d(bottleneck_input_ch, bottleneck_ch, kernel_size=1),
+            GRN(bottleneck_ch, eps=1e-6),
+        )
         self.middle_blocks = nn.ModuleList([
-            RoDitBlock(channels=ch, **rodit_block_args),
-            RoDitBlock(channels=ch, **rodit_block_args)
+            RoDitBlock(channels=bottleneck_ch, **rodit_block_args),
+            RoDitBlock(channels=bottleneck_ch, **rodit_block_args)
         ])
+        ch = bottleneck_ch
 
         # === Decoder ===
         self.up_blocks = nn.ModuleList()
@@ -1241,9 +1350,8 @@ class RoDitUnet(nn.Module):
 
             # Create an upsampler to transition from the deeper layer's channel count (`ch`)
             # to the current level's channel count (`target_ch`).
-            # No upsampler is needed for the first (deepest) decoder stage.
-            if i < self.num_levels - 1:
-                self.up_samplers.append(Upsample(in_channels=ch, out_channels=target_ch))
+            # The ch in the first iteration is the bottleneck channel count.
+            self.up_samplers.append(Upsample(in_channels=ch, out_channels=target_ch))
 
             # The projection convolution handles the channel merging after concatenation.
             # The input will be the concatenation of the upsampled feature map (`target_ch`)
@@ -1268,7 +1376,7 @@ class RoDitUnet(nn.Module):
         # --- Final Output Layers ---
         if num_groups > ch > 0:
             num_groups = ch
-        self.out_norm = nn.GroupNorm(num_groups, ch) if ch > 0 and ch % num_groups == 0 else nn.Identity()
+        self.out_norm = nn.GroupNorm(num_groups, ch, eps=1e-6) if ch > 0 and ch % num_groups == 0 else nn.Identity()
         self.out_act = nn.SiLU()
         self.conv_out = nn.Conv2d(ch, out_channels, 3, padding=1, padding_mode=padding_mode)
 
@@ -1288,7 +1396,7 @@ class RoDitUnet(nn.Module):
                 downsampling factor, or if the number of conditions is incorrect.
         """
         B, C, H, W = x.shape
-        min_size = 2 ** (self.num_levels - 1)
+        min_size = 2 ** self.num_levels
         if H % min_size != 0 or W % min_size != 0:
             raise ValueError(f"Input H/W ({H}/{W}) must be divisible by the total downsampling factor {min_size}")
 
@@ -1323,34 +1431,33 @@ class RoDitUnet(nn.Module):
             for block in self.down_blocks[i]:
                 h = block(h, final_emb)
             skips.append(h)
-            if i < self.num_levels - 1:
-                h = self.down_samplers[i](h)
+            h = self.down_samplers[i](h)
 
         # === Bottleneck ===
+        h = self.to_bottleneck(h)
         for block in self.middle_blocks:
             h = block(h, final_emb)
 
         # === Decoder ===
         # The decoder modules were built from deep to shallow, so we iterate through them directly.
         for i in range(self.num_levels):
-            # Retrieve the corresponding skip connection from the encoder.
-            skip_h = skips.pop()
+            # Retrieve the corresponding module from ModuleList (index i corresponds to the i-th decoder level, from deep to shallow)
 
-            # The channel counts of `h` (from the deeper layer) and `skip_h` are now identical.
-            # Concatenate them along the channel dimension.
+            # Upsample and change channels of h from the deeper layer via Upsampler
+            h = self.up_samplers[i](h)
+
+            # Extract the corresponding skip connection
+            skip_h = skips.pop()  # pop() retrieves from the end, matching the deep-to-shallow order
+
+            # Concatenate
             h = torch.cat([h, skip_h], dim=1)
 
-            # Project the concatenated features to merge them and restore the channel count.
+            # Project to merge channels
             h = self.up_proj_convs[i](h)
 
-            # Perform feature refinement using the RoDitBlock for this level.
+            # Execute blocks at this level
             for block in self.up_blocks[i]:
                 h = block(h, final_emb)
-
-            # Upsample the feature map for the next (shallower) level.
-            # This is skipped for the last (shallowest) level of the decoder.
-            if i < self.num_levels - 1:
-                h = self.up_samplers[i](h)
 
         # === Output ===
         h = self.out_norm(h)
@@ -1452,13 +1559,27 @@ class TestCoreModules(unittest.TestCase):
         with self.assertRaises(ValueError):
             RotaryEmbedding2D(dim=10)  # Not divisible by 4
 
-    def test_conditional_sa_with_rope(self):
-        """Test ConditionalSAWithRoPE module."""
-        cond_sa = ConditionalSAWithRoPE(dim=self.emb_dim).to(self.device)
-        emb1 = torch.randn(self.batch_size, self.emb_dim).to(self.device)
-        emb2 = torch.randn(self.batch_size, self.emb_dim).to(self.device)
-        output = cond_sa([emb1, emb2])
+    def test_conditional_msa_with_rope(self):
+        """Test ConditionalMSAWithRoPE module."""
+        num_heads = 4
+        self.assertTrue(self.emb_dim % num_heads == 0, "emb_dim must be divisible by num_heads for test.")
+        msa_cond = ConditionalMSAWithRoPE(
+            dim=self.emb_dim,
+            num_heads=num_heads,
+            seq_len=self.seq_len,
+        ).to(self.device)
+        embeddings = [
+            torch.randn(self.batch_size, self.emb_dim).to(self.device)
+            for _ in range(self.seq_len)
+        ]
+        output = msa_cond(embeddings)
         self.assertEqual(output.shape, (self.batch_size, self.emb_dim))
+        self.assertTrue(torch.isfinite(output).all())
+        with self.assertRaises(ValueError):
+            ConditionalMSAWithRoPE(dim=self.emb_dim, num_heads=7, seq_len=self.seq_len)
+        wrong_embeddings = embeddings + [torch.randn(self.batch_size, self.emb_dim).to(self.device)]
+        with self.assertRaises(RuntimeError):
+            msa_cond(wrong_embeddings)
 
     def test_msa_with_rope(self):
         """Test MSAWithRoPE module."""
@@ -1580,21 +1701,26 @@ class TestBuildingBlocks(unittest.TestCase):
 
 
 class TestRoDitUnet(unittest.TestCase):
-    """Comprehensive tests for the full RoDitUnet model."""
+    """
+    Comprehensive tests for the full RoDitUnet model, updated for the new
+    downsample_out_ch_mult behavior where the last element controls the bottleneck.
+    """
 
     def setUp(self):
         """Set up common variables for the U-Net tests."""
         self.batch_size = 2
         self.in_channels = 3
         self.out_channels = 3
-        self.height = 32  # Must be divisible by 2^(num_levels-1)
-        self.width = 32
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # To test 3 Encoder/Decoder levels, downsample_out_ch_mult must have 4 elements.
+        # With 3 downsampling stages (2^3=8), height/width should be a multiple of 8.
+        self.height = 32
+        self.width = 32
         self.base_config = {
             "in_channels": self.in_channels,
             "out_channels": self.out_channels,
             "model_channels": 32,
-            "channel_mult": (1, 2, 4),  # 3 levels (0, 1, 2)
+            "downsample_out_ch_mult": (1, 2, 4, 8),  # Represents 3 encoder/decoder levels + 1 bottleneck level
             "num_blocks": 2,
             "num_heads": 4,
         }
@@ -1625,29 +1751,30 @@ class TestRoDitUnet(unittest.TestCase):
 
     def test_architecture_based_on_start_attn_level(self):
         """Verify that `start_attn_level` correctly configures the block types."""
-        num_levels = len(self.base_config["channel_mult"])
+        num_levels = len(self.base_config["downsample_out_ch_mult"]) - 1
+        self.assertEqual(num_levels, 3, "Test setup should result in 3 encoder/decoder levels.")
 
-        # Define test scenarios: start_level and expected block types for encoder/decoder
+        # Update test cases to match the 3-level structure (levels 0, 1, 2).
         test_cases = [
             {
                 "desc": "All levels use attention",
                 "start_attn_level": 0,
-                "expected_block": RoDitBlock,
+                "expected_block": RoDitBlock,  # Applies to all levels
             },
             {
                 "desc": "Attention starts at level 1",
                 "start_attn_level": 1,
-                "expected_block": [ResnetBlock, RoDitBlock, RoDitBlock],
+                "expected_block": [ResnetBlock, RoDitBlock, RoDitBlock],  # For levels 0, 1, 2
             },
             {
-                "desc": "Attention starts at the last level",
-                "start_attn_level": num_levels - 1,
-                "expected_block": [ResnetBlock, ResnetBlock, RoDitBlock],
+                "desc": "Attention starts at the last level (level 2)",
+                "start_attn_level": num_levels - 1,  # This is 2
+                "expected_block": [ResnetBlock, ResnetBlock, RoDitBlock],  # For levels 0, 1, 2
             },
             {
-                "desc": "Only bottleneck uses attention",
-                "start_attn_level": num_levels,
-                "expected_block": ResnetBlock,
+                "desc": "Only bottleneck uses attention (all encoder/decoder levels are Resnet)",
+                "start_attn_level": num_levels,  # This is 3
+                "expected_block": ResnetBlock,  # Applies to all levels
             },
         ]
 
@@ -1669,9 +1796,10 @@ class TestRoDitUnet(unittest.TestCase):
                                           "Bottleneck block should always be RoDitBlock")
 
                 # 3. Verify Decoder (up_blocks)
-                # up_blocks are ordered from deep to shallow (level 2, 1, 0)
+                # up_blocks are ordered from deep to shallow (corresponding to levels 2, 1, 0)
                 for i, level_blocks in enumerate(model.up_blocks):
-                    level_idx = num_levels - 1 - i  # Convert up_block index to level index
+                    # Convert the up_block index i (0, 1, 2) back to the level index (2, 1, 0)
+                    level_idx = num_levels - 1 - i
                     expected = case["expected_block"]
                     BlockType = expected[level_idx] if isinstance(expected, list) else expected
                     for block in level_blocks:
