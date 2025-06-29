@@ -140,6 +140,93 @@ class ECA(nn.Module):
         return x * y.expand_as(x)
 
 
+class SpatialMQA(nn.Module):
+    """
+    A plug-and-play Spatial Multi-Query Attention module.
+
+    This module treats each spatial location (H*W) of the input feature map
+    as a query and performs attention with a single Key/Value pair derived
+    from an external condition vector. This is a direct application of the
+    Multi-Query Attention (MQA) concept for spatial feature modulation.
+    """
+    def __init__(self,
+                 channels: int,
+                 emb_dim: int,
+                 head_dim: int = None,
+                 output_type: str = 'mask'):
+        """
+        Initializes the SpatialMQA module.
+
+        Args:
+            channels (int): Number of channels (C) of the input feature map.
+            emb_dim (int): Dimension of the external condition vector.
+            head_dim (int, optional): The dimension for Q, K, V projections.
+                                      Defaults to `channels` if None.
+            output_type (str, optional): The type of output to generate.
+                                         Must be one of ['mask', 'feature'].
+                                         Defaults to 'mask'.
+        """
+        super().__init__()
+
+        if output_type not in ['mask', 'feature']:
+            raise ValueError("output_type must be either 'mask' or 'feature'")
+
+        self.output_type = output_type
+        self.head_dim = head_dim if head_dim is not None else channels
+
+        # Projection layers
+        self.to_q = nn.Linear(channels, self.head_dim, bias=False)
+        self.to_kv = nn.Linear(emb_dim, self.head_dim * 2, bias=False)
+
+        if self.output_type == 'mask':
+            # Layer to project attended features to a single score for the mask
+            self.to_score = nn.Linear(self.head_dim, 1)
+        else: # 'feature' mode
+            # Layer to project attended features back to the original channel dimension
+            self.to_out = nn.Linear(self.head_dim, channels)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the SpatialMQA module.
+
+        Args:
+            x (torch.Tensor): Input feature map of shape (B, C, H, W).
+            condition (torch.Tensor): Condition vector of shape (B, emb_dim).
+
+        Returns:
+            torch.Tensor: The output tensor.
+                          If output_type is 'mask', shape is (B, 1, H, W).
+                          If output_type is 'feature', shape is (B, C, H, W).
+        """
+        B, C, H, W = x.shape
+
+        # 1. Prepare Q, K, V
+        # Flatten x to a sequence of H*W spatial tokens (queries)
+        q_input = x.view(B, C, H * W).permute(0, 2, 1) # (B, H*W, C)
+        q = self.to_q(q_input) # (B, H*W, head_dim)
+
+        # Treat condition as a single K/V pair
+        condition_unsqueezed = condition.unsqueeze(1) # (B, 1, emb_dim)
+        k, v = self.to_kv(condition_unsqueezed).chunk(2, dim=-1) # k, v are (B, 1, head_dim)
+
+        # 2. Perform scaled dot-product attention
+        # PyTorch automatically handles the MQA optimization here due to the shapes
+        # q: (B, H*W, head_dim), k: (B, 1, head_dim), v: (B, 1, head_dim)
+        attn_output = F.scaled_dot_product_attention(q, k, v, enable_gqa=True) # (B, H*W, head_dim)
+
+        # 3. Generate final output based on the specified type
+        if self.output_type == 'mask':
+            scores = self.to_score(attn_output) # (B, H*W, 1)
+            mask = scores.view(B, H, W, 1).permute(0, 3, 1, 2) # (B, 1, H, W)
+            return self.sigmoid(mask)
+        else: # 'feature' mode
+            features = self.to_out(attn_output) # (B, H*W, channels)
+            features = features.permute(0, 2, 1).view(B, C, H, W) # (B, C, H, W)
+            return features
+
+
 class RotaryEmbedding1D(nn.Module):
     """Implements 1D Rotary Positional Embedding (RoPE).
 
@@ -1012,34 +1099,36 @@ class ResnetBlock(nn.Module):
 
 
 # ==============================================================================
-# Downsampling & Upsampling Modules
+# ConditionalDownsampling & ConditionalUpsampling Modules
 # ==============================================================================
 
-class Downsample(nn.Module):
-    """Downsampling layer using a mix of pooling and strided convolution.
+class ConditionalDownsample(nn.Module):
+    """Downsampling layer conditioned by SpatialMQA.
 
-    This layer combines features from a strided convolution, average pooling,
-    and max pooling to create a robust downsampled representation.
-
-    If the input or output channels are zero, it acts as an identity function,
-    returning an empty tensor with the appropriate spatial dimensions.
+    This layer downsamples the input by combining features from a strided
+    convolution, average pooling, and max pooling. It then uses a SpatialMQA
+    module to gate the concatenated features based on an external condition
+    before a final projection.
 
     Attributes:
-        out_channels: Number of output channels.
-        is_identity: If True, the module acts as an identity function.
-        conv_in: A depthwise convolution layer to process the input.
-        avg_pool: Average pooling layer for downsampling.
-        max_pool: Max pooling layer for downsampling.
-        conv_out: A 1x1 convolution to merge the feature maps.
+        out_channels (int): Number of output channels.
+        is_identity (bool): If True, the module acts as a pass-through.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, padding_mode: str = "circular"):
-        """Initializes the Downsample module.
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        emb_dim: int,
+        padding_mode: str = "circular"
+    ):
+        """Initializes the ConditionalDownsample module.
 
         Args:
-            in_channels: Number of input channels.
-            out_channels: Number of output channels.
-            padding_mode: Padding mode for the strided convolution.
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+            emb_dim (int): Dimension of the external condition vector for MQA.
+            padding_mode (str): Padding mode for the strided convolution.
         """
         super().__init__()
         self.out_channels = out_channels
@@ -1048,86 +1137,112 @@ class Downsample(nn.Module):
             return
 
         self.conv_in = nn.Conv2d(
-            in_channels, in_channels,
-            3,
-            stride=2,
-            padding=1,
-            padding_mode=padding_mode,
-            groups=in_channels
+            in_channels, in_channels, 3,
+            stride=2, padding=1, padding_mode=padding_mode, groups=in_channels
         )
         self.avg_pool = nn.AvgPool2d(2, stride=2)
         self.max_pool = nn.MaxPool2d(2, stride=2)
-        # 1x1 convolution to merge the three feature maps
-        self.conv_out = nn.Conv2d(
-            in_channels * 3, out_channels,
-            1,
+
+        # MQA module operates on the concatenated features
+        mqa_in_channels = in_channels * 3
+        self.spatial_mqa = SpatialMQA(
+            channels=mqa_in_channels,
+            emb_dim=emb_dim,
+            output_type='mask'
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass for the Downsample module."""
+        self.conv_out = nn.Conv2d(mqa_in_channels, out_channels, 1)
+
+    def forward(self, x: Tensor, condition: Tensor) -> Tensor:
+        """Forward pass for the ConditionalDownsample module.
+
+        Args:
+            x (Tensor): Input feature map of shape (B, C_in, H, W).
+            condition (Tensor): The external condition vector of shape (B, emb_dim).
+
+        Returns:
+            Tensor: The downsampled and conditioned feature map of shape
+                    (B, C_out, H/2, W/2).
+        """
         if self.is_identity:
             B, _, H, W = x.shape
             new_H, new_W = H // 2, W // 2
             return torch.zeros((B, 0, new_H, new_W), dtype=x.dtype, device=x.device)
 
-        features = torch.cat([self.conv_in(x), self.avg_pool(x), self.max_pool(x)], dim=1)
-        return self.conv_out(features)
+        features = torch.cat([
+            self.conv_in(x), self.avg_pool(x), self.max_pool(x)
+        ], dim=1)
+
+        spatial_mask = self.spatial_mqa(features, condition)
+        gated_features = features * spatial_mask
+
+        return self.conv_out(gated_features)
 
 
-class Upsample(nn.Module):
-    """Upsampling layer using PixelShuffle.
+class ConditionalUpsample(nn.Module):
+    """Upsampling layer using PixelShuffle, conditioned by SpatialMQA.
 
-    This layer first increases the number of channels and then rearranges
-    them into a higher resolution feature map using PixelShuffle.
-    The final convolution can refine the features.
-
-    If the input or output channels are zero, it acts as an identity function,
-    returning an empty tensor with the appropriate spatial dimensions.
+    This layer first increases channel count, then uses PixelShuffle to
+    increase spatial resolution. It applies a conditional spatial gate via
+    SpatialMQA after the upsampling operation and before a final
+    refinement convolution.
 
     Attributes:
-        out_channels: Number of output channels.
-        scale_factor: The factor by which to increase spatial resolution.
-        is_identity: If True, the module acts as an identity function.
-        conv1: A depthwise convolution layer to increase channels.
-        pixel_shuffle: PixelShuffle layer to rearrange channels into spatial dimensions.
-        conv2: A 1x1 convolution to refine the output features.
+        out_channels (int): Number of output channels.
+        scale_factor (int): The factor for spatial upsampling.
+        is_identity (bool): If True, the module acts as a pass-through.
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
+        emb_dim: int,
         scale_factor: int = 2,
         padding_mode: str = "circular"
     ):
-        """Initializes the Upsample module.
+        """Initializes the ConditionalUpsample module.
 
         Args:
-            in_channels: Number of input channels.
-            out_channels: Number of output channels.
-            scale_factor: The factor by which to increase spatial resolution.
-            padding_mode: Padding mode for convolutions.
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+            emb_dim (int): Dimension of the external condition vector for MQA.
+            scale_factor (int): The factor for spatial upsampling.
+            padding_mode (str): Padding mode for convolutions.
         """
         super().__init__()
         self.out_channels = out_channels
         self.scale_factor = scale_factor
         self.is_identity = in_channels == 0 or out_channels == 0
+        if self.is_identity:
+            return
 
         self.conv1 = nn.Conv2d(
-            in_channels, out_channels * (scale_factor ** 2),
-            3,
-            padding=1,
-            padding_mode=padding_mode,
-            groups=in_channels
+            in_channels, out_channels * (scale_factor ** 2), 3,
+            padding=1, padding_mode=padding_mode, groups=in_channels
         )
         self.pixel_shuffle = nn.PixelShuffle(scale_factor)
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels,
-            1,
+
+        # MQA module operates after PixelShuffle, on the target channel count
+        self.spatial_mqa = SpatialMQA(
+            channels=out_channels,
+            emb_dim=emb_dim,
+            output_type='mask'
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass for the Upsample module."""
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 1)
+
+    def forward(self, x: Tensor, condition: Tensor) -> Tensor:
+        """Forward pass for the ConditionalUpsample module.
+
+        Args:
+            x (Tensor): Input feature map of shape (B, C_in, H, W).
+            condition (Tensor): The external condition vector of shape (B, emb_dim).
+
+        Returns:
+            Tensor: The upsampled and conditioned feature map of shape
+                    (B, C_out, H*S, W*S), where S is the scale_factor.
+        """
         if self.is_identity:
             B, _, H, W = x.shape
             new_H, new_W = H * self.scale_factor, W * self.scale_factor
@@ -1135,8 +1250,11 @@ class Upsample(nn.Module):
 
         x = self.conv1(x)
         x = self.pixel_shuffle(x)
-        x = self.conv2(x)
-        return x
+
+        spatial_mask = self.spatial_mqa(x, condition)
+        gated_x = x * spatial_mask
+
+        return self.conv2(gated_x)
 
 
 # ==============================================================================
@@ -1322,7 +1440,14 @@ class RoDitUnet(nn.Module):
             skip_channels.append(current_level_channels)
 
             # Create a downsampler to transition from `current_level_channels` to `next_level_channels`.
-            self.down_samplers.append(Downsample(in_channels=current_level_channels, out_channels=next_level_channels))
+            self.down_samplers.append(
+                ConditionalDownsample(
+                    in_channels=current_level_channels,
+                    out_channels=next_level_channels,
+                    emb_dim=self.emb_dim,
+                    padding_mode=padding_mode,
+                )
+            )
 
         # Update channels entering the bottleneck
         bottleneck_input_ch = ch_schedule[-1]
@@ -1351,7 +1476,15 @@ class RoDitUnet(nn.Module):
             # Create an upsampler to transition from the deeper layer's channel count (`ch`)
             # to the current level's channel count (`target_ch`).
             # The ch in the first iteration is the bottleneck channel count.
-            self.up_samplers.append(Upsample(in_channels=ch, out_channels=target_ch))
+            self.up_samplers.append(
+                ConditionalUpsample(
+                    in_channels=ch,
+                    out_channels=target_ch,
+                    emb_dim=self.emb_dim,
+                    scale_factor=2,
+                    padding_mode=padding_mode
+                )
+            )
 
             # The projection convolution handles the channel merging after concatenation.
             # The input will be the concatenation of the upsampled feature map (`target_ch`)
@@ -1431,7 +1564,7 @@ class RoDitUnet(nn.Module):
             for block in self.down_blocks[i]:
                 h = block(h, final_emb)
             skips.append(h)
-            h = self.down_samplers[i](h)
+            h = self.down_samplers[i](h, final_emb)
 
         # === Bottleneck ===
         h = self.to_bottleneck(h)
@@ -1444,7 +1577,7 @@ class RoDitUnet(nn.Module):
             # Retrieve the corresponding module from ModuleList (index i corresponds to the i-th decoder level, from deep to shallow)
 
             # Upsample and change channels of h from the deeper layer via Upsampler
-            h = self.up_samplers[i](h)
+            h = self.up_samplers[i](h, final_emb)
 
             # Extract the corresponding skip connection
             skip_h = skips.pop()  # pop() retrieves from the end, matching the deep-to-shallow order
@@ -1531,6 +1664,40 @@ class TestCoreModules(unittest.TestCase):
         eca_identity = ECA(0)
         output_identity = eca_identity(x)
         self.assertTrue(torch.allclose(x, output_identity))
+
+    def test_spatial_mqa(self):
+        """Test SpatialMQA module for both 'mask' and 'feature' modes."""
+        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
+        condition = torch.randn(self.batch_size, self.emb_dim).to(self.device)
+
+        mqa_mask = SpatialMQA(
+            channels=self.channels,
+            emb_dim=self.emb_dim,
+            output_type='mask'
+        ).to(self.device)
+        mask_output = mqa_mask(x, condition)
+
+        self.assertEqual(mask_output.shape, (self.batch_size, 1, self.height, self.width),
+                         "Shape mismatch in 'mask' mode")
+
+        self.assertTrue(torch.all(mask_output >= 0) and torch.all(mask_output <= 1),
+                        "Mask output values should be in the range [0, 1]")
+
+        mqa_feature = SpatialMQA(
+            channels=self.channels,
+            emb_dim=self.emb_dim,
+            output_type='feature'
+        ).to(self.device)
+        feature_output = mqa_feature(x, condition)
+
+        self.assertEqual(feature_output.shape, x.shape,
+                         "Shape mismatch in 'feature' mode")
+
+        self.assertFalse(torch.allclose(feature_output, x, atol=1e-6),
+                         "Feature output should be different from the input")
+
+        with self.assertRaises(ValueError, msg="Should raise ValueError for invalid output_type"):
+            SpatialMQA(channels=self.channels, emb_dim=self.emb_dim, output_type='invalid_type')
 
     def test_rotary_embedding_1d(self):
         """Test RotaryEmbedding1D module."""
@@ -1681,22 +1848,25 @@ class TestBuildingBlocks(unittest.TestCase):
         output_identity = block_identity(x, emb)
         self.assertTrue(torch.allclose(x, output_identity))
 
-    def test_upsample(self):
-        """Test Upsample module."""
-        scale_factor = 2
-        up = Upsample(in_channels=self.channels, out_channels=self.channels // 2, scale_factor=scale_factor).to(
-            self.device)
+    def test_conditional_downsample(self):
+        """Test ConditionalDownsample module."""
+        down = ConditionalDownsample(
+            in_channels=self.channels, out_channels=self.channels * 2, emb_dim=self.emb_dim
+        ).to(self.device)
         x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
-        output = up(x)
-        expected_shape = (self.batch_size, self.channels // 2, self.height * scale_factor, self.width * scale_factor)
+        output = down(x, torch.randn(self.batch_size, self.emb_dim).to(self.device))
+        expected_shape = (self.batch_size, self.channels * 2, self.height // 2, self.width // 2)
         self.assertEqual(output.shape, expected_shape)
 
-    def test_downsample(self):
-        """Test Downsample module."""
-        down = Downsample(in_channels=self.channels, out_channels=self.channels * 2).to(self.device)
+    def test_conditional_upsample(self):
+        """Test ConditionalUpsample module."""
+        scale_factor = 2
+        up = ConditionalUpsample(
+            in_channels=self.channels, out_channels=self.channels // 2, scale_factor=scale_factor, emb_dim=self.emb_dim
+        ).to(self.device)
         x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
-        output = down(x)
-        expected_shape = (self.batch_size, self.channels * 2, self.height // 2, self.width // 2)
+        output = up(x, torch.randn(self.batch_size, self.emb_dim).to(self.device))
+        expected_shape = (self.batch_size, self.channels // 2, self.height * scale_factor, self.width * scale_factor)
         self.assertEqual(output.shape, expected_shape)
 
 
