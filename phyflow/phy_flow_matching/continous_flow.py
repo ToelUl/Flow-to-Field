@@ -38,6 +38,8 @@ try:
 except ImportError:
     _MATPLOTLIB_AVAILABLE = False
 
+torch.set_float32_matmul_precision('high')
+
 # --- Configure logging ---
 logging.basicConfig(
     level=logging.INFO,
@@ -503,7 +505,7 @@ class CFMExecutor:
         Returns:
             The unscaled loss value for this step.
         """
-        x1, condition = data.to(self.device), label.to(self.device)
+        x1, temp = data.to(self.device), label.to(self.device)
 
         # Sample $x_0$ from a standard Normal distribution (common choice for base).
         x_0 = torch.randn_like(x1, device=self.device)
@@ -517,7 +519,7 @@ class CFMExecutor:
 
         # Get model's predicted velocity $v(x_t, t, condition)$.
         model_output = self.model(
-            x=path_sample.x_t, time=path_sample.t, conditions=[condition, ]
+            x=path_sample.x_t, time=path_sample.t, conditions=[temp,]
         )
 
         # Compute loss (e.g., MSE between predicted and target velocity).
@@ -630,8 +632,8 @@ class CFMExecutor:
             processed_batches_in_accum_cycle = 0
             optimizer_steps_in_epoch = 0
             last_clip_value_used = None
-            if epoch > 0: # Increase sigma_logit after the first epoch
-                if sigma_logit_increase_per_epoch > 0:
+            if epoch > self.starting_epoch: # Increase sigma_logit after the first epoch
+                if sigma_logit_increase_per_epoch != 0:
                     sigma_logit += sigma_logit_increase_per_epoch
                     logger.info(
                         f"Increasing sigma_logit by {sigma_logit_increase_per_epoch:.4f} "
@@ -639,7 +641,7 @@ class CFMExecutor:
                     )
                 else:
                     logger.info(
-                        "Keeping sigma_logit = 1 for this epoch."
+                        f"Keeping sigma_logit = {sigma_logit:.4f} for this epoch."
                     )
 
             # Create a batch iterator that randomly cycles through dataloaders
@@ -1521,8 +1523,8 @@ class CFMExecutor:
                 if isinstance(batch_content, (list, tuple)):
                     x_init_batch = batch_content[0].to(self.device)
                     if len(batch_content) > 1:
-                        conditions_batch = batch_content[1].to(self.device)
-                        current_model_extras['conditions'] = [conditions_batch, ]
+                        temp = batch_content[1].to(self.device)
+                        current_model_extras['conditions'] = [temp,]
                 else:
                     x_init_batch = batch_content.to(self.device)
                     current_model_extras.pop('conditions', None) # Clear if not provided
