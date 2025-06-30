@@ -5,7 +5,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+import logging
 
+torch.set_float32_matmul_precision('high')
+
+sympy_interp_logger = logging.getLogger("torch.utils._sympy.interp")
+sympy_interp_logger.setLevel(logging.ERROR)
 
 # ==============================================================================
 # Helper Function
@@ -19,24 +24,14 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
     embedding (e.g., a time embedding).
 
     Args:
-        x: The input tensor. Can be 2D (B, C) or 4D (B, C, H, W).
+        x: The input tensor. 4D (B, C, H, W).
         shift: The shift vector, broadcastable to `x`.
         scale: The scale vector, broadcastable to `x`.
 
     Returns:
         The modulated tensor.
-
-    Raises:
-        ValueError: If the input tensor has an unsupported dimension.
     """
-    if x.dim() == 4:
-        # For 4D tensors, scale and shift are applied channel-wise.
-        return x * (1 + scale.unsqueeze(-1).unsqueeze(-1)) + shift.unsqueeze(-1).unsqueeze(-1)
-    elif x.dim() == 2:
-        # For 2D tensors, scale and shift are applied feature-wise.
-        return x * (1 + scale) + shift
-    else:
-        raise ValueError(f"Unsupported input dimension {x.dim()}. Expected 2 or 4.")
+    return x * (1 + scale.unsqueeze(-1).unsqueeze(-1)) + shift.unsqueeze(-1).unsqueeze(-1)
 
 
 # ==============================================================================
@@ -140,93 +135,7 @@ class ECA(nn.Module):
         return x * y.expand_as(x)
 
 
-class SpatialMQA(nn.Module):
-    """
-    A plug-and-play Spatial Multi-Query Attention module.
-
-    This module treats each spatial location (H*W) of the input feature map
-    as a query and performs attention with a single Key/Value pair derived
-    from an external condition vector. This is a direct application of the
-    Multi-Query Attention (MQA) concept for spatial feature modulation.
-    """
-    def __init__(self,
-                 channels: int,
-                 emb_dim: int,
-                 head_dim: int = None,
-                 output_type: str = 'mask'):
-        """
-        Initializes the SpatialMQA module.
-
-        Args:
-            channels (int): Number of channels (C) of the input feature map.
-            emb_dim (int): Dimension of the external condition vector.
-            head_dim (int, optional): The dimension for Q, K, V projections.
-                                      Defaults to `channels` if None.
-            output_type (str, optional): The type of output to generate.
-                                         Must be one of ['mask', 'feature'].
-                                         Defaults to 'mask'.
-        """
-        super().__init__()
-
-        if output_type not in ['mask', 'feature']:
-            raise ValueError("output_type must be either 'mask' or 'feature'")
-
-        self.output_type = output_type
-        self.head_dim = head_dim if head_dim is not None else channels
-
-        # Projection layers
-        self.to_q = nn.Linear(channels, self.head_dim, bias=False)
-        self.to_kv = nn.Linear(emb_dim, self.head_dim * 2, bias=False)
-
-        if self.output_type == 'mask':
-            # Layer to project attended features to a single score for the mask
-            self.to_score = nn.Linear(self.head_dim, 1)
-        else: # 'feature' mode
-            # Layer to project attended features back to the original channel dimension
-            self.to_out = nn.Linear(self.head_dim, channels)
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the SpatialMQA module.
-
-        Args:
-            x (torch.Tensor): Input feature map of shape (B, C, H, W).
-            condition (torch.Tensor): Condition vector of shape (B, emb_dim).
-
-        Returns:
-            torch.Tensor: The output tensor.
-                          If output_type is 'mask', shape is (B, 1, H, W).
-                          If output_type is 'feature', shape is (B, C, H, W).
-        """
-        B, C, H, W = x.shape
-
-        # 1. Prepare Q, K, V
-        # Flatten x to a sequence of H*W spatial tokens (queries)
-        q_input = x.view(B, C, H * W).permute(0, 2, 1) # (B, H*W, C)
-        q = self.to_q(q_input) # (B, H*W, head_dim)
-
-        # Treat condition as a single K/V pair
-        condition_unsqueezed = condition.unsqueeze(1) # (B, 1, emb_dim)
-        k, v = self.to_kv(condition_unsqueezed).chunk(2, dim=-1) # k, v are (B, 1, head_dim)
-
-        # 2. Perform scaled dot-product attention
-        # PyTorch automatically handles the MQA optimization here due to the shapes
-        # q: (B, H*W, head_dim), k: (B, 1, head_dim), v: (B, 1, head_dim)
-        attn_output = F.scaled_dot_product_attention(q, k, v, enable_gqa=True) # (B, H*W, head_dim)
-
-        # 3. Generate final output based on the specified type
-        if self.output_type == 'mask':
-            scores = self.to_score(attn_output) # (B, H*W, 1)
-            mask = scores.view(B, H, W, 1).permute(0, 3, 1, 2) # (B, 1, H, W)
-            return self.sigmoid(mask)
-        else: # 'feature' mode
-            features = self.to_out(attn_output) # (B, H*W, channels)
-            features = features.permute(0, 2, 1).view(B, C, H, W) # (B, C, H, W)
-            return features
-
-
+@torch.compiler.disable(recursive=True)
 class RotaryEmbedding1D(nn.Module):
     """Implements 1D Rotary Positional Embedding (RoPE).
 
@@ -352,6 +261,7 @@ class RotaryEmbedding1D(nn.Module):
         return rotated_q, rotated_k
 
 
+@torch.compiler.disable(recursive=True)
 class RotaryEmbedding2D(nn.Module):
     """Implements 2D Rotary Positional Embedding (RoPE).
 
@@ -503,6 +413,7 @@ class RotaryEmbedding2D(nn.Module):
         return rotated_q, rotated_k
 
 
+@torch.compiler.disable(recursive=True)
 class ConditionalMSAWithRoPE(nn.Module):
     """A Multi-Head Self-Attention block for fusing conditional embeddings
     with RoPE.
@@ -555,9 +466,9 @@ class ConditionalMSAWithRoPE(nn.Module):
 
         # The input projection remains the same
         self.input_projection = nn.Sequential(
-            nn.Linear(dim, 4 * dim),
+            nn.Linear(dim, 2 * dim),
             nn.SiLU(),
-            nn.Linear(4 * dim, dim),
+            nn.Linear(2 * dim, dim),
         )
         self.norm = nn.RMSNorm(dim, eps=1e-6)
 
@@ -780,37 +691,6 @@ class GRN(nn.Module):
         return self.gamma * (x * nx) + self.beta + x
 
 
-class GRN1D(nn.Module):
-    """Global Response Normalization (GRN) layer for 1D inputs.
-
-    This is a variant of GRN designed for 1D inputs, such as time series or
-    embeddings. It normalizes the input based on its global response.
-
-    Attributes:
-        gamma: A learnable scaling parameter.
-        beta: A learnable shifting parameter.
-        eps: A small value to prevent division by zero.
-    """
-
-    def __init__(self, channels: int, eps: float = 1e-6):
-        """Initializes the GRN1D module.
-
-        Args:
-            channels: The number of input channels.
-            eps: A small epsilon value for numerical stability. Defaults to 1e-6.
-        """
-        super().__init__()
-        self.gamma = nn.Parameter(torch.zeros(1, channels))
-        self.beta = nn.Parameter(torch.zeros(1, channels))
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass for the GRN1D module."""
-        gx = torch.norm(x, p=2, dim=-1, keepdim=True)
-        nx = gx / (gx.mean(dim=-1, keepdim=True) + self.eps)
-        return self.gamma * (x * nx) + self.beta + x
-
-
 class Mlp(nn.Module):
     """Multi-Layer Perceptron for spatial features.
 
@@ -866,6 +746,7 @@ class Mlp(nn.Module):
         return x
 
 
+@torch.compile
 class RoDitBlock(nn.Module):
     """A Diffusion transformer like convolutional block with rotary embeddings.
 
@@ -882,7 +763,6 @@ class RoDitBlock(nn.Module):
         eca: Efficient Channel Attention for the attention output.
         norm2: Group normalization before the MLP block.
         mlp: The MLP module.
-        emb_mlp: A small MLP to process the input embedding.
         adaLN_modulation: A linear layer to generate shift and scale parameters
             from the input embedding.
     """
@@ -934,14 +814,6 @@ class RoDitBlock(nn.Module):
             act_layer=lambda: nn.GELU(approximate="tanh"),
             drop=dropout,
         )
-        self.emb_mlp = nn.Sequential(
-            nn.RMSNorm(emb_dim, eps=1e-6),
-            nn.Linear(emb_dim, 4 * emb_dim),
-            nn.GELU(approximate="tanh"),
-            GRN1D(4 * emb_dim),
-            nn.Linear(4 * emb_dim, emb_dim),
-            nn.Dropout(dropout),
-        )
         modulation_dim = channels * 6  # 6 for: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -964,11 +836,8 @@ class RoDitBlock(nn.Module):
         if self.is_identity:
             return x
 
-        emb = self.emb_mlp(emb)
-
         # Generate modulation parameters from the embedding
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(emb).chunk(6, dim=1)
-
         # First residual sub-block (Attention)
         h_attn = self.norm1(x)
         h_attn = modulate(h_attn, shift_msa, scale_msa)
@@ -983,6 +852,7 @@ class RoDitBlock(nn.Module):
         return h + gate_mlp.unsqueeze(-1).unsqueeze(-1) * h_mlp
 
 
+@torch.compile
 class ResnetBlock(nn.Module):
     """A ResNet-like block with depthwise convolution and ECA.
 
@@ -1000,7 +870,6 @@ class ResnetBlock(nn.Module):
         eca: Efficient Channel Attention for the depthwise convolution output.
         norm2: Group normalization before the MLP block.
         mlp: The MLP module.
-        emb_mlp: A small MLP to process the input embedding.
         adaLN_modulation: A linear layer to generate modulation parameters
             from the input embedding.
     """
@@ -1049,14 +918,6 @@ class ResnetBlock(nn.Module):
             act_layer=lambda: nn.GELU(approximate="tanh"),
             drop=dropout,
         )
-        self.emb_mlp = nn.Sequential(
-            nn.RMSNorm(emb_dim, eps=1e-6),
-            nn.Linear(emb_dim, 4 * emb_dim),
-            nn.GELU(approximate="tanh"),
-            GRN1D(4 * emb_dim),
-            nn.Linear(4 * emb_dim, emb_dim),
-            nn.Dropout(dropout),
-        )
         modulation_dim = channels * 6  # 6 for: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -1079,8 +940,6 @@ class ResnetBlock(nn.Module):
         if self.is_identity:
             return x
 
-        emb = self.emb_mlp(emb)
-
         # Generate modulation parameters from the embedding
         shift_dwc, scale_dwc, gate_dwc, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(emb).chunk(6, dim=1)
 
@@ -1098,17 +957,175 @@ class ResnetBlock(nn.Module):
         return h + gate_mlp.unsqueeze(-1).unsqueeze(-1) * h_mlp
 
 
+@torch.compile
+class ConditionalChannelProjection(nn.Module):
+    """Conditional channel projection layer.
+
+    This layer projects an input tensor to a specified number of output channels
+    while applying modulation based on an external condition vector.
+
+    Attributes:
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
+    """
+
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            emb_dim: int,
+            num_groups: int = 4,
+            padding_mode: str = "circular",
+    ):
+        """Initializes the FinalLayer module.
+
+        Args:
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+            emb_dim (int): Dimension of the external condition vector.
+            num_groups (int): Number of groups for GroupNorm. Will be adjusted to be a
+                divisor of `in_channels`.
+            padding_mode (str): Padding mode for the spatial attention.
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.is_identity = in_channels == 0 or out_channels == 0
+        if self.is_identity:
+            return
+
+        if in_channels % num_groups != 0:
+            valid_divisors = [g for g in range(num_groups, 0, -1) if in_channels % g == 0]
+            num_groups = valid_divisors[0] if valid_divisors else 1
+
+        self.norm = nn.GroupNorm(num_groups, in_channels, affine=False, eps=1e-6)
+
+        modulation_dim = in_channels * 2
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_dim, modulation_dim, bias=True)
+        )
+        # Initialize the final modulation projection to be zero
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=1
+        )
+
+    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
+        """Forward pass for the FinalLayer module.
+
+        Args:
+            x (Tensor): Input feature map of shape (B, C_in, H, W).
+            emb (Tensor): The external condition vector of shape (B, emb_dim).
+
+        Returns:
+            Tensor: Output feature map of shape (B, C_out, H, W).
+        """
+        if self.is_identity:
+            B, _, H, W = x.shape
+            return torch.zeros((B, self.out_channels, H, W), dtype=x.dtype, device=x.device)
+
+        scale, shift = self.adaLN_modulation(emb).chunk(2, dim=1)
+
+        x = modulate(self.norm(x), shift, scale)
+
+        return self.conv(x)
+
+
+@torch.compile
+class FinalLayer(nn.Module):
+    """Final layer of the U-Net
+
+    This layer is used to produce the final output of the U-Net architecture.
+    It applies Group Normalization, a modulation based on an external condition
+    vector, and a final convolution to produce the output feature map.
+
+    Attributes:
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
+    """
+
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            emb_dim: int,
+            num_groups: int = 4,
+            padding_mode: str = "circular",
+    ):
+        """Initializes the FinalLayer module.
+
+        Args:
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+            emb_dim (int): Dimension of the external condition vector.
+            num_groups (int): Number of groups for GroupNorm. Will be adjusted to be a
+                divisor of `in_channels`.
+            padding_mode (str): Padding mode for the final convolution.
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.is_identity = in_channels == 0 or out_channels == 0
+        if self.is_identity:
+            return
+
+        if in_channels % num_groups != 0:
+            valid_divisors = [g for g in range(num_groups, 0, -1) if in_channels % g == 0]
+            num_groups = valid_divisors[0] if valid_divisors else 1
+
+        self.norm = nn.GroupNorm(num_groups, in_channels, affine=False, eps=1e-6)
+
+        modulation_dim = in_channels * 2
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_dim, modulation_dim, bias=True)
+        )
+        # Initialize the final modulation projection to be zero
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+
+        self.act = nn.GELU(approximate="tanh")
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3,
+            padding=1, padding_mode=padding_mode
+        )
+
+    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
+        """Forward pass for the FinalLayer module.
+
+        Args:
+            x (Tensor): Input feature map of shape (B, C_in, H, W).
+            emb (Tensor): The external condition vector of shape (B, emb_dim).
+
+        Returns:
+            Tensor: Output feature map of shape (B, C_out, H, W).
+        """
+        if self.is_identity:
+            B, _, H, W = x.shape
+            return torch.zeros((B, self.out_channels, H, W), dtype=x.dtype, device=x.device)
+
+        scale, shift = self.adaLN_modulation(emb).chunk(2, dim=1)
+
+        x = modulate(self.norm(x), shift, scale)
+
+        x = self.act(x)
+
+        return self.conv(x)
+
+
 # ==============================================================================
 # ConditionalDownsampling & ConditionalUpsampling Modules
 # ==============================================================================
-
+@torch.compile
 class ConditionalDownsample(nn.Module):
     """Downsampling layer conditioned by SpatialMQA.
 
     This layer downsamples the input by combining features from a strided
-    convolution, average pooling, and max pooling. It then uses a SpatialMQA
-    module to gate the concatenated features based on an external condition
-    before a final projection.
+    convolution, average pooling, and max pooling. It uses an external condition
+    vector to modulate the features before the final convolution.
 
     Attributes:
         out_channels (int): Number of output channels.
@@ -1120,14 +1137,14 @@ class ConditionalDownsample(nn.Module):
         in_channels: int,
         out_channels: int,
         emb_dim: int,
-        padding_mode: str = "circular"
+        padding_mode: str = "circular",
     ):
         """Initializes the ConditionalDownsample module.
 
         Args:
             in_channels (int): Number of input channels.
             out_channels (int): Number of output channels.
-            emb_dim (int): Dimension of the external condition vector for MQA.
+            emb_dim (int): Dimension of the external condition vector.
             padding_mode (str): Padding mode for the strided convolution.
         """
         super().__init__()
@@ -1143,22 +1160,23 @@ class ConditionalDownsample(nn.Module):
         self.avg_pool = nn.AvgPool2d(2, stride=2)
         self.max_pool = nn.MaxPool2d(2, stride=2)
 
-        # MQA module operates on the concatenated features
-        mqa_in_channels = in_channels * 3
-        self.spatial_mqa = SpatialMQA(
-            channels=mqa_in_channels,
-            emb_dim=emb_dim,
-            output_type='mask'
+        modulation_dim = in_channels * 6
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_dim, modulation_dim, bias=True)
         )
+        # Initialize the final modulation projection to be zero
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
 
-        self.conv_out = nn.Conv2d(mqa_in_channels, out_channels, 1)
+        self.conv_out = nn.Conv2d(3 * in_channels, out_channels, 1)
 
-    def forward(self, x: Tensor, condition: Tensor) -> Tensor:
+    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
         """Forward pass for the ConditionalDownsample module.
 
         Args:
             x (Tensor): Input feature map of shape (B, C_in, H, W).
-            condition (Tensor): The external condition vector of shape (B, emb_dim).
+            emb (Tensor): The external condition vector of shape (B, emb_dim).
 
         Returns:
             Tensor: The downsampled and conditioned feature map of shape
@@ -1173,19 +1191,18 @@ class ConditionalDownsample(nn.Module):
             self.conv_in(x), self.avg_pool(x), self.max_pool(x)
         ], dim=1)
 
-        spatial_mask = self.spatial_mqa(features, condition)
-        gated_features = features * spatial_mask
+        scale, shift = self.adaLN_modulation(emb).chunk(2, dim=1)
+        features = modulate(features, shift, scale)
 
-        return self.conv_out(gated_features)
+        return self.conv_out(features)
 
-
+@torch.compile
 class ConditionalUpsample(nn.Module):
     """Upsampling layer using PixelShuffle, conditioned by SpatialMQA.
 
     This layer first increases channel count, then uses PixelShuffle to
-    increase spatial resolution. It applies a conditional spatial gate via
-    SpatialMQA after the upsampling operation and before a final
-    refinement convolution.
+    increase spatial resolution. It applies an external condition vector
+    to modulate the features before the final convolution.
 
     Attributes:
         out_channels (int): Number of output channels.
@@ -1199,14 +1216,14 @@ class ConditionalUpsample(nn.Module):
         out_channels: int,
         emb_dim: int,
         scale_factor: int = 2,
-        padding_mode: str = "circular"
+        padding_mode: str = "circular",
     ):
         """Initializes the ConditionalUpsample module.
 
         Args:
             in_channels (int): Number of input channels.
             out_channels (int): Number of output channels.
-            emb_dim (int): Dimension of the external condition vector for MQA.
+            emb_dim (int): Dimension of the external condition vector.
             scale_factor (int): The factor for spatial upsampling.
             padding_mode (str): Padding mode for convolutions.
         """
@@ -1223,21 +1240,23 @@ class ConditionalUpsample(nn.Module):
         )
         self.pixel_shuffle = nn.PixelShuffle(scale_factor)
 
-        # MQA module operates after PixelShuffle, on the target channel count
-        self.spatial_mqa = SpatialMQA(
-            channels=out_channels,
-            emb_dim=emb_dim,
-            output_type='mask'
+        modulation_dim = out_channels * 2
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_dim, modulation_dim, bias=True)
         )
+        # Initialize the final modulation projection to be zero
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
 
         self.conv2 = nn.Conv2d(out_channels, out_channels, 1)
 
-    def forward(self, x: Tensor, condition: Tensor) -> Tensor:
+    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
         """Forward pass for the ConditionalUpsample module.
 
         Args:
             x (Tensor): Input feature map of shape (B, C_in, H, W).
-            condition (Tensor): The external condition vector of shape (B, emb_dim).
+            emb (Tensor): The external condition vector of shape (B, emb_dim).
 
         Returns:
             Tensor: The upsampled and conditioned feature map of shape
@@ -1251,15 +1270,22 @@ class ConditionalUpsample(nn.Module):
         x = self.conv1(x)
         x = self.pixel_shuffle(x)
 
-        spatial_mask = self.spatial_mqa(x, condition)
-        gated_x = x * spatial_mask
+        scale, shift = self.adaLN_modulation(emb).chunk(2, dim=1)
+        x = modulate(x, shift, scale)
 
-        return self.conv2(gated_x)
+        return self.conv2(x)
 
 
 # ==============================================================================
 # Main Model: RoDitUnet
 # ==============================================================================
+@torch.compile(
+    options={
+        "max_autotune": True,
+        "epilogue_fusion": True,
+        "triton.cudagraphs": True,
+    }
+)
 class RoDitUnet(nn.Module):
     """Diffusion Transformer like U-Net with Rotary Embedding.
 
@@ -1305,20 +1331,20 @@ class RoDitUnet(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels: int = 1,
-        out_channels: int = 1,
-        model_channels: int = 32,
-        downsample_out_ch_mult: Sequence[int] = (2, 2, 4,),
-        start_attn_level: int = 0,
-        num_blocks: int = 1,
-        dropout: float = 0.1,
-        num_heads: int = 8,
-        num_groups: int = 8,
-        num_conditions: int = 0,
-        emb_dim: Optional[int] = None,
-        padding_mode: str = "circular",
-        alpha: float = 1.0
+            self,
+            in_channels: int = 1,
+            out_channels: int = 1,
+            model_channels: int = 32,
+            downsample_out_ch_mult: Sequence[int] = (2, 2, 4,),
+            start_attn_level: int = 0,
+            num_blocks: int = 1,
+            dropout: float = 0.1,
+            num_heads: int = 8,
+            num_groups: int = 8,
+            num_conditions: int = 0,
+            emb_dim: Optional[int] = None,
+            padding_mode: str = "circular",
+            alpha: float = 1.0
     ):
         """Initializes the RoDitUnet model.
 
@@ -1454,9 +1480,12 @@ class RoDitUnet(nn.Module):
 
         # === Bottleneck ===
         bottleneck_ch = model_channels * self.bottleneck_channel_mult
-        self.to_bottleneck = nn.Sequential(
-            nn.Conv2d(bottleneck_input_ch, bottleneck_ch, kernel_size=1),
-            GRN(bottleneck_ch, eps=1e-6),
+        self.to_bottleneck = ConditionalChannelProjection(
+            in_channels=bottleneck_input_ch,
+            out_channels=bottleneck_ch,
+            emb_dim=self.emb_dim,
+            num_groups=num_groups,
+            padding_mode=padding_mode,
         )
         self.middle_blocks = nn.ModuleList([
             RoDitBlock(channels=bottleneck_ch, **rodit_block_args),
@@ -1482,7 +1511,7 @@ class RoDitUnet(nn.Module):
                     out_channels=target_ch,
                     emb_dim=self.emb_dim,
                     scale_factor=2,
-                    padding_mode=padding_mode
+                    padding_mode=padding_mode,
                 )
             )
 
@@ -1507,11 +1536,13 @@ class RoDitUnet(nn.Module):
             ch = target_ch
 
         # --- Final Output Layers ---
-        if num_groups > ch > 0:
-            num_groups = ch
-        self.out_norm = nn.GroupNorm(num_groups, ch, eps=1e-6) if ch > 0 and ch % num_groups == 0 else nn.Identity()
-        self.out_act = nn.SiLU()
-        self.conv_out = nn.Conv2d(ch, out_channels, 3, padding=1, padding_mode=padding_mode)
+        self.final_layer = FinalLayer(
+            in_channels=ch,
+            out_channels=out_channels,
+            emb_dim=self.emb_dim,
+            num_groups=num_groups,
+            padding_mode=padding_mode,
+        )
 
     def forward(self, x: Tensor, time: Tensor, conditions: Optional[Sequence[Tensor]] = None, **keywords) -> Tensor:
         """The forward pass of the RoDitUnet model.
@@ -1567,7 +1598,7 @@ class RoDitUnet(nn.Module):
             h = self.down_samplers[i](h, final_emb)
 
         # === Bottleneck ===
-        h = self.to_bottleneck(h)
+        h = self.to_bottleneck(h, final_emb)
         for block in self.middle_blocks:
             h = block(h, final_emb)
 
@@ -1593,9 +1624,7 @@ class RoDitUnet(nn.Module):
                 h = block(h, final_emb)
 
         # === Output ===
-        h = self.out_norm(h)
-        h = self.out_act(h)
-        return self.conv_out(h)
+        return self.final_layer(h, final_emb)
 
 
 # ==============================================================================
@@ -1614,21 +1643,6 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertEqual(output.shape, x.shape)
         # Check if modulation was applied (output should not be equal to input)
         self.assertFalse(torch.allclose(output, x))
-
-    def test_modulate_2d(self):
-        """Test modulate with 2D tensor."""
-        x = torch.randn(2, 16)
-        shift = torch.randn(2, 16)
-        scale = torch.randn(2, 16)
-        output = modulate(x, shift, scale)
-        self.assertEqual(output.shape, x.shape)
-        self.assertFalse(torch.allclose(output, x))
-
-    def test_modulate_unsupported_dim(self):
-        """Test modulate with unsupported tensor dimension."""
-        with self.assertRaises(ValueError):
-            modulate(torch.randn(2, 16, 8), torch.randn(2, 16), torch.randn(2, 16))
-
 
 class TestCoreModules(unittest.TestCase):
     """Tests for core neural network modules."""
@@ -1664,40 +1678,6 @@ class TestCoreModules(unittest.TestCase):
         eca_identity = ECA(0)
         output_identity = eca_identity(x)
         self.assertTrue(torch.allclose(x, output_identity))
-
-    def test_spatial_mqa(self):
-        """Test SpatialMQA module for both 'mask' and 'feature' modes."""
-        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
-        condition = torch.randn(self.batch_size, self.emb_dim).to(self.device)
-
-        mqa_mask = SpatialMQA(
-            channels=self.channels,
-            emb_dim=self.emb_dim,
-            output_type='mask'
-        ).to(self.device)
-        mask_output = mqa_mask(x, condition)
-
-        self.assertEqual(mask_output.shape, (self.batch_size, 1, self.height, self.width),
-                         "Shape mismatch in 'mask' mode")
-
-        self.assertTrue(torch.all(mask_output >= 0) and torch.all(mask_output <= 1),
-                        "Mask output values should be in the range [0, 1]")
-
-        mqa_feature = SpatialMQA(
-            channels=self.channels,
-            emb_dim=self.emb_dim,
-            output_type='feature'
-        ).to(self.device)
-        feature_output = mqa_feature(x, condition)
-
-        self.assertEqual(feature_output.shape, x.shape,
-                         "Shape mismatch in 'feature' mode")
-
-        self.assertFalse(torch.allclose(feature_output, x, atol=1e-6),
-                         "Feature output should be different from the input")
-
-        with self.assertRaises(ValueError, msg="Should raise ValueError for invalid output_type"):
-            SpatialMQA(channels=self.channels, emb_dim=self.emb_dim, output_type='invalid_type')
 
     def test_rotary_embedding_1d(self):
         """Test RotaryEmbedding1D module."""
@@ -1782,26 +1762,6 @@ class TestCoreModules(unittest.TestCase):
         self.assertEqual(transformed_output.shape, x.shape)
         self.assertFalse(torch.allclose(transformed_output, x),
                          "After setting parameters to non-zero, GRN should transform the input.")
-
-    def test_grn1d(self):
-        """Test GRN1D module."""
-        grn1d = GRN1D(self.channels).to(self.device)
-        x = torch.randn(self.batch_size, self.channels).to(self.device)
-
-        # Verify initial state: When gamma and beta are 0, the output should be equal to the input (identity mapping).
-        initial_output = grn1d(x)
-        self.assertTrue(torch.allclose(initial_output, x),
-                        "GRN1D's initial output should be identical to its input due to zero initialization.")
-
-        with torch.no_grad():
-            # Set gamma and beta to 1
-            grn1d.gamma.fill_(1.0)
-            grn1d.beta.fill_(1.0)
-
-        transformed_output = grn1d(x)
-        self.assertEqual(transformed_output.shape, x.shape)
-        self.assertFalse(torch.allclose(transformed_output, x),
-                         "After setting parameters to non-zero, GRN1D should transform the input.")
 
     def test_mlp(self):
         """Test Mlp module."""
