@@ -18,7 +18,8 @@ class MCDataset(Dataset):
         include_system_size (bool): Whether system size is included in the labels.
     """
 
-    def __init__(self, data: torch.Tensor, labels: torch.Tensor, include_system_size: bool = False,
+    def __init__(self, data: torch.Tensor, labels: torch.Tensor,
+                 include_system_size: bool = False, rad_to_vector: bool = False,
                  transform: Optional[transforms.Compose] = None ) -> None:
         """Initializes the MonteCarloDataset.
 
@@ -30,6 +31,7 @@ class MCDataset(Dataset):
                   temperature T and the second column is the system size L.
                 - If include_system_size is False, shape should be (B,), containing only the temperature T.
             include_system_size (bool, optional): Whether to include system size in the label. Defaults to False.
+            rad_to_vector (bool, optional): If True, convert radial coordinates to vector form.
             transform (Optional[transforms.Compose], optional): Optional transform to be applied to the data.
 
         Raises:
@@ -58,6 +60,9 @@ class MCDataset(Dataset):
 
         # Reshape data from (B, C*N, L, L) to (B * C*N, 1, L, L)
         self.data = data.reshape(batch_size * channels_times_n, 1, l_dim, l_dim)
+        if rad_to_vector:
+            # Convert radial coordinates to vector form
+            self.data = torch.cat([torch.cos(self.data), torch.sin(self.data)], dim=1)
 
         # Expand labels
         if self.include_system_size:
