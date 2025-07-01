@@ -15,7 +15,7 @@ sympy_interp_logger.setLevel(logging.ERROR)
 # ==============================================================================
 # Helper Function
 # ==============================================================================
-
+@torch.compile
 def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
     """Applies a learned affine transformation to the input tensor.
 
@@ -37,7 +37,7 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 # ==============================================================================
 # Core Modules
 # ==============================================================================
-
+@torch.compile
 class SinusoidalPosEmb(nn.Module):
     """Creates sinusoidal positional embeddings.
 
@@ -87,52 +87,6 @@ class SinusoidalPosEmb(nn.Module):
         ).to(x.device)
         args = x.float().unsqueeze(1) * freqs.unsqueeze(0)
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-
-
-class ECA(nn.Module):
-    """Efficient Channel Attention (ECA) block.
-
-    An efficient channel attention mechanism that uses a 1D convolution to
-    generate channel-wise attention weights.
-
-    Attributes:
-        use_eca: A boolean flag indicating if ECA is active.
-        avg_pool: Adaptive average pooling layer.
-        conv: 1D convolution layer for generating attention weights.
-        sigmoid: Sigmoid activation to normalize weights.
-    """
-
-    def __init__(self, channels: int, b: int = 1, gamma: int = 2):
-        """Initializes the ECA module.
-
-        Args:
-            channels: The number of input channels. If less than or equal to 0,
-                the block will act as an identity function.
-            b: A parameter to adjust the kernel size calculation. Defaults to 1.
-            gamma: A parameter to adjust the kernel size calculation. Defaults to 2.
-        """
-        super().__init__()
-        self.use_eca = channels > 0
-        if not self.use_eca:
-            return
-
-        # Calculate kernel size dynamically based on channel number
-        kernel_size = int(abs((math.log(channels, 2) + b) / gamma))
-        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass for the ECA block."""
-        if not self.use_eca:
-            return x
-
-        y = self.avg_pool(x).squeeze(-1).transpose(-1, -2)  # (B, C, 1, 1) -> (B, C, 1) -> (B, 1, C)
-        y = self.conv(y).transpose(-1, -2).unsqueeze(-1)    # (B, 1, C) -> (B, C, 1) -> (B, C, 1, 1)
-        y = self.sigmoid(y)
-        return x * y.expand_as(x)
 
 
 @torch.compiler.disable(recursive=True)
@@ -466,9 +420,9 @@ class ConditionalMSAWithRoPE(nn.Module):
 
         # The input projection remains the same
         self.input_projection = nn.Sequential(
-            nn.Linear(dim, 2 * dim),
+            nn.Linear(dim, 4 * dim),
             nn.SiLU(),
-            nn.Linear(2 * dim, dim),
+            nn.Linear(4 * dim, dim),
         )
         self.norm = nn.RMSNorm(dim, eps=1e-6)
 
@@ -657,40 +611,6 @@ class MSAWithRoPE(nn.Module):
         return x + out.transpose(-1, -2).reshape(B, C, H, W)
 
 
-class GRN(nn.Module):
-    """Global Response Normalization (GRN) layer.
-
-    As proposed in the ConvNeXt V2 paper, GRN enhances feature competition
-    by normalizing feature maps based on their global response.
-
-    Attributes:
-        gamma: A learnable scaling parameter.
-        beta: A learnable shifting parameter.
-        eps: A small value to prevent division by zero.
-    """
-
-    def __init__(self, channels: int, eps: float = 1e-6):
-        """Initializes the GRN module.
-
-        Args:
-            channels: The number of input channels.
-            eps: A small epsilon value for numerical stability. Defaults to 1e-6.
-        """
-        super().__init__()
-        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass for the GRN module."""
-        # Calculate global feature descriptor (L2 norm)
-        gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
-        # Normalize the global descriptor
-        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
-        # Apply the GRN transformation
-        return self.gamma * (x * nx) + self.beta + x
-
-
 class Mlp(nn.Module):
     """Multi-Layer Perceptron for spatial features.
 
@@ -732,7 +652,6 @@ class Mlp(nn.Module):
 
         self.pw_conv1 = nn.Conv2d(in_channels, hidden_channels, 1, bias=bias)
         self.act = act_layer()
-        self.norm2 = GRN(hidden_channels)
         self.pw_conv2 = nn.Conv2d(hidden_channels, out_channels, 1, bias=bias)
         self.drop = nn.Dropout(drop)
 
@@ -740,7 +659,6 @@ class Mlp(nn.Module):
         """Forward pass for the Mlp module."""
         x = self.pw_conv1(x)
         x = self.act(x)
-        x = self.norm2(x)
         x = self.pw_conv2(x)
         x = self.drop(x)
         return x
@@ -760,7 +678,6 @@ class RoDitBlock(nn.Module):
         is_identity: If True, the block acts as an identity function.
         norm1: Group normalization before the attention block.
         attn: The multi-head self-attention module.
-        eca: Efficient Channel Attention for the attention output.
         norm2: Group normalization before the MLP block.
         mlp: The MLP module.
         adaLN_modulation: A linear layer to generate shift and scale parameters
@@ -807,7 +724,6 @@ class RoDitBlock(nn.Module):
             padding_mode=padding_mode,
             alpha=alpha,
         )
-        self.eca = ECA(channels)
         self.norm2 = nn.GroupNorm(num_groups, channels, affine=False, eps=1e-6)
         self.mlp = Mlp(
             channels,
@@ -842,7 +758,6 @@ class RoDitBlock(nn.Module):
         h_attn = self.norm1(x)
         h_attn = modulate(h_attn, shift_msa, scale_msa)
         h_attn = self.attn(h_attn)
-        h_attn = self.eca(h_attn)
         h = x + gate_msa.unsqueeze(-1).unsqueeze(-1) * h_attn
 
         # Second residual sub-block (MLP)
@@ -854,10 +769,10 @@ class RoDitBlock(nn.Module):
 
 @torch.compile
 class ResnetBlock(nn.Module):
-    """A ResNet-like block with depthwise convolution and ECA.
+    """A ResNet-like block with depthwise convolution.
 
     This block is designed for use in diffusion models, combining depthwise
-    convolution, Efficient Channel Attention (ECA), and a multi-layer perceptron
+    convolution, and a multi-layer perceptron
     (MLP) for feature processing. It supports modulation based on an input
     embedding, allowing dynamic adjustment of the block's behavior.
 
@@ -867,7 +782,6 @@ class ResnetBlock(nn.Module):
         is_identity: If True, the block acts as an identity function.
         norm1: Group normalization before the depthwise convolution.
         dw_conv: Depthwise convolution layer.
-        eca: Efficient Channel Attention for the depthwise convolution output.
         norm2: Group normalization before the MLP block.
         mlp: The MLP module.
         adaLN_modulation: A linear layer to generate modulation parameters
@@ -911,7 +825,6 @@ class ResnetBlock(nn.Module):
             padding_mode=padding_mode,
             groups=channels  # Depthwise convolution
         )
-        self.eca = ECA(channels)
         self.norm2 = nn.GroupNorm(num_groups, channels, affine=False, eps=1e-6)
         self.mlp = Mlp(
             channels,
@@ -947,7 +860,6 @@ class ResnetBlock(nn.Module):
         h_dwc = self.norm1(x)
         h_dwc = modulate(h_dwc, shift_dwc, scale_dwc)
         h_dwc = self.dw_conv(h_dwc)
-        h_dwc = self.eca(h_dwc)
         h = x + gate_dwc.unsqueeze(-1).unsqueeze(-1) * h_dwc
 
         # Second residual sub-block (MLP)
@@ -975,7 +887,6 @@ class ConditionalChannelProjection(nn.Module):
             out_channels: int,
             emb_dim: int,
             num_groups: int = 4,
-            padding_mode: str = "circular",
     ):
         """Initializes the FinalLayer module.
 
@@ -1024,8 +935,7 @@ class ConditionalChannelProjection(nn.Module):
             Tensor: Output feature map of shape (B, C_out, H, W).
         """
         if self.is_identity:
-            B, _, H, W = x.shape
-            return torch.zeros((B, self.out_channels, H, W), dtype=x.dtype, device=x.device)
+            return x
 
         scale, shift = self.adaLN_modulation(emb).chunk(2, dim=1)
 
@@ -1157,10 +1067,8 @@ class ConditionalDownsample(nn.Module):
             in_channels, in_channels, 3,
             stride=2, padding=1, padding_mode=padding_mode, groups=in_channels
         )
-        self.avg_pool = nn.AvgPool2d(2, stride=2)
-        self.max_pool = nn.MaxPool2d(2, stride=2)
 
-        modulation_dim = in_channels * 6
+        modulation_dim = in_channels * 3
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(emb_dim, modulation_dim, bias=True)
@@ -1169,7 +1077,7 @@ class ConditionalDownsample(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
 
-        self.conv_out = nn.Conv2d(3 * in_channels, out_channels, 1)
+        self.conv_out = nn.Conv2d(in_channels, out_channels, 1)
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
         """Forward pass for the ConditionalDownsample module.
@@ -1183,16 +1091,12 @@ class ConditionalDownsample(nn.Module):
                     (B, C_out, H/2, W/2).
         """
         if self.is_identity:
-            B, _, H, W = x.shape
-            new_H, new_W = H // 2, W // 2
-            return torch.zeros((B, 0, new_H, new_W), dtype=x.dtype, device=x.device)
+            return x
 
-        features = torch.cat([
-            self.conv_in(x), self.avg_pool(x), self.max_pool(x)
-        ], dim=1)
-
-        scale, shift = self.adaLN_modulation(emb).chunk(2, dim=1)
-        features = modulate(features, shift, scale)
+        mod_shift, mod_scale, mod_gate = self.adaLN_modulation(emb).chunk(3, dim=1)
+        features = modulate(x, mod_shift, mod_scale)
+        features = self.conv_in(features)
+        features = mod_gate.unsqueeze(-1).unsqueeze(-1) * features + features
 
         return self.conv_out(features)
 
@@ -1249,7 +1153,6 @@ class ConditionalUpsample(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
 
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 1)
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
         """Forward pass for the ConditionalUpsample module.
@@ -1263,17 +1166,12 @@ class ConditionalUpsample(nn.Module):
                     (B, C_out, H*S, W*S), where S is the scale_factor.
         """
         if self.is_identity:
-            B, _, H, W = x.shape
-            new_H, new_W = H * self.scale_factor, W * self.scale_factor
-            return torch.zeros((B, 0, new_H, new_W), dtype=x.dtype, device=x.device)
+            return x
 
-        x = self.conv1(x)
-        x = self.pixel_shuffle(x)
+        shift, scale = self.adaLN_modulation(emb).chunk(2, dim=1)
+        h_ps = self.pixel_shuffle(self.conv1(x))
 
-        scale, shift = self.adaLN_modulation(emb).chunk(2, dim=1)
-        x = modulate(x, shift, scale)
-
-        return self.conv2(x)
+        return h_ps + modulate(h_ps, shift, scale)
 
 
 # ==============================================================================
@@ -1485,7 +1383,6 @@ class RoDitUnet(nn.Module):
             out_channels=bottleneck_ch,
             emb_dim=self.emb_dim,
             num_groups=num_groups,
-            padding_mode=padding_mode,
         )
         self.middle_blocks = nn.ModuleList([
             RoDitBlock(channels=bottleneck_ch, **rodit_block_args),
@@ -1667,18 +1564,6 @@ class TestCoreModules(unittest.TestCase):
         with self.assertRaises(ValueError):
             SinusoidalPosEmb(0)
 
-    def test_eca(self):
-        """Test ECA module."""
-        eca = ECA(self.channels).to(self.device)
-        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
-        output = eca(x)
-        self.assertEqual(output.shape, x.shape)
-
-        # Test identity case
-        eca_identity = ECA(0)
-        output_identity = eca_identity(x)
-        self.assertTrue(torch.allclose(x, output_identity))
-
     def test_rotary_embedding_1d(self):
         """Test RotaryEmbedding1D module."""
         rope = RotaryEmbedding1D(dim=self.emb_dim).to(self.device)
@@ -1741,27 +1626,6 @@ class TestCoreModules(unittest.TestCase):
             MSAWithRoPE(channels=30, num_heads=4)  # Channels not divisible by heads
         with self.assertRaises(AssertionError):
             MSAWithRoPE(channels=32, num_heads=5)  # Head dim not div by 4
-
-    def test_grn(self):
-        """Test GRN module."""
-        grn = GRN(self.channels).to(self.device)
-        x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
-
-        # Verify initial state: When gamma and beta are 0, the output should be equal to the input (identity mapping).
-        # This is a check for the correctness of the initialization behavior.
-        initial_output = grn(x)
-        self.assertTrue(torch.allclose(initial_output, x),
-                        "GRN's initial output should be identical to its input due to zero initialization.")
-
-        with torch.no_grad():
-            # 將 gamma 和 beta 的值都設為 1
-            grn.gamma.fill_(1.0)
-            grn.beta.fill_(1.0)
-
-        transformed_output = grn(x)
-        self.assertEqual(transformed_output.shape, x.shape)
-        self.assertFalse(torch.allclose(transformed_output, x),
-                         "After setting parameters to non-zero, GRN should transform the input.")
 
     def test_mlp(self):
         """Test Mlp module."""
