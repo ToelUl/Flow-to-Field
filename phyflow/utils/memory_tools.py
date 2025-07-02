@@ -61,7 +61,7 @@ def _measure_activation_bytes(
         dummy_x = torch.zeros((1, channels, height, width), dtype=dtype, device=device)
         dummy_time = torch.zeros((1,), dtype=dtype, device=device)
         dummy_condition = torch.zeros((1,), dtype=dtype, device=device)
-        _ = model(dummy_x, dummy_time, [dummy_condition, ])
+        _ = model(dummy_x, dummy_time, [dummy_condition, dummy_condition])
 
     # Clean up by removing the hooks
     for h in hooks:
