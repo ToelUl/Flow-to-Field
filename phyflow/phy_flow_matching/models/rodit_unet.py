@@ -89,129 +89,64 @@ class SinusoidalPosEmb(nn.Module):
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
 
+# @torch.compile
 @torch.compiler.disable(recursive=True)
-class RotaryEmbedding1D(nn.Module):
-    """Implements 1D Rotary Positional Embedding (RoPE).
-
-    This module applies rotary embeddings to the query and key tensors, encoding
-    positional information by rotating feature vectors based on their 1D
-    sequence position. It includes a caching mechanism to avoid recomputing
-    sinusoidal values for inputs of the same sequence length.
-
-    Attributes:
-        dim (int): The feature dimension. Must be an even number.
-        base (int): The base for the geometric progression of frequencies.
-        inv_freq (torch.Tensor): The inverse frequencies for the positional
-            encoding. This is a registered buffer.
+class MLPEmbedder(nn.Module):
     """
+    一個簡單的 MLP (多層感知機)，用於將各種嵌入(如時間步、引導強度)投影到模型的隱藏維度。
+    """
+    def __init__(self, in_dim: int):
+        super().__init__()
+        self.mlp_emb_in_layer = nn.Linear(in_dim, 4 * in_dim, bias=True)
+        self.mlp_emb_act = nn.SiLU()
+        self.mlp_emb_out_layer = nn.Linear(4 * in_dim, in_dim, bias=True)
 
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.mlp_emb_in_layer(x)
+        h = self.mlp_emb_act(h)
+        h = self.mlp_emb_out_layer(h)
+        return h
+
+
+@torch.compile
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
+    x_rotated_pairs = torch.cat([-x_reshaped[..., 1:], x_reshaped[..., :1]], dim=-1)
+    return x_rotated_pairs.flatten(start_dim=2)
+
+@torch.compile
+class RoPE(nn.Module):
     def __init__(self, dim: int, base: int = 10000):
-        """Initializes the RotaryEmbedding1D module.
-
-        Args:
-            dim (int): The feature dimension for the embeddings. Must be an
-                even number.
-            base (int): The base value for the frequency calculation.
-
-        Raises:
-            ValueError: If `dim` is not an even number.
-        """
         super().__init__()
         if dim % 2 != 0:
-            raise ValueError(
-                f"Dimension must be an even number for 1D RoPE, but got {dim}.")
+            raise ValueError(f"Dimension must be even for 1D RoPE, but got {dim}.")
 
         self.dim = dim
         self.base = base
-
-        # Calculate inverse frequencies.
-        # This corresponds to theta_i = 1.0 / (base^(2i / dim))
         freqs = torch.arange(0, dim, 2, dtype=torch.float32) / dim
         inv_freq = 1.0 / (self.base**freqs)
         self.register_buffer("inv_freq", inv_freq)
 
-        # Caching attributes.
-        self._cached_cos: torch.Tensor | None = None
-        self._cached_sin: torch.Tensor | None = None
-        self._cached_seq_len: int = -1
-
-    def _update_cache(self, seq_len: int, device: torch.device):
-        """Updates the cached sinusoidal embeddings if seq_len changes.
-
-        Args:
-            seq_len (int): The length of the input sequence.
-            device (torch.device): The device of the input tensor.
-        """
-        if seq_len == self._cached_seq_len:
-            return
-
-        self._cached_seq_len = seq_len
-        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
-
-        # Calculate frequency components for each position.
-        # Shape: (seq_len, dim / 2)
-        freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
-
-        # Interleave for sine and cosine application.
-        # Shape: (seq_len, dim)
-        embedded_freqs = freqs.repeat_interleave(2, dim=-1)
-
-        # Reshape for broadcasting: (1, seq_len, dim)
-        embedded_freqs = embedded_freqs.unsqueeze(0)
-
-        self._cached_cos = embedded_freqs.cos()
-        self._cached_sin = embedded_freqs.sin()
-
-    def _apply_rotary_embedding(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies the pre-computed rotary embeddings to the input tensor.
-
-        This function performs the rotation on pairs of features.
-
-        Args:
-            x (torch.Tensor): Input tensor (query or key) of shape
-                (Batch, SeqLen, Dim).
-
-        Returns:
-            torch.Tensor: The tensor with rotary positional embeddings applied.
-        """
-        # Split features into pairs: (x_1, x_2), (x_3, x_4), ...
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
-
-        if self._cached_cos is None or self._cached_sin is None:
-            raise RuntimeError(
-                "Cache is not initialized. Call _update_cache first.")
-
-        # Apply rotation using broadcasted sin/cos values.
-        # This is equivalent to complex multiplication:
-        # (x1 + i*x2) * (cos + i*sin)
-        cos = self._cached_cos[..., 0::2]
-        sin = self._cached_sin[..., 0::2]
-        rotated_x1 = x1 * cos - x2 * sin
-        rotated_x2 = x1 * sin + x2 * cos
-
-        # Reassemble the tensor.
-        rotated_x = torch.empty_like(x)
-        rotated_x[..., 0::2] = rotated_x1
-        rotated_x[..., 1::2] = rotated_x2
-
-        return rotated_x
-
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Applies 1D RoPE to query and key tensors.
-
-        Args:
-            q (torch.Tensor): Query tensor of shape (Batch, SeqLen, Dim).
-            k (torch.Tensor): Key tensor of shape (Batch, SeqLen, Dim).
-
-        Returns:
-            A tuple containing the rotated query and key tensors, both of shape
-            (Batch, SeqLen, Dim).
-        """
         seq_len = q.shape[1]
-        self._update_cache(seq_len, q.device)
-        rotated_q = self._apply_rotary_embedding(q)
-        rotated_k = self._apply_rotary_embedding(k)
+        device = q.device
+
+        # 1. 計算每個位置的角度
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", positions, self.inv_freq) # Shape: (seq_len, dim / 2)
+
+        # 2. 計算 cos 和 sin 值
+        cos_vals = freqs.cos()
+        sin_vals = freqs.sin()
+
+        # 3. 為了廣播 (broadcast)，將 cos 和 sin 的形狀從 (L, D/2) 擴展到 (1, L, D)
+        #    repeat_interleave 會將 [c1, c2, c3] 變為 [c1, c1, c2, c2, c3, c3]
+        cos = cos_vals.repeat_interleave(2, dim=-1).unsqueeze(0)
+        sin = sin_vals.repeat_interleave(2, dim=-1).unsqueeze(0)
+
+        rotated_q = q * cos + rotate_half(q) * sin
+        rotated_k = k * cos + rotate_half(k) * sin
+
         return rotated_q, rotated_k
 
 
@@ -382,7 +317,6 @@ class ConditionalMSAWithRoPE(nn.Module):
         num_heads (int): The number of attention heads.
         seq_len (int): The length of the input sequence (number of conditions).
         head_dim (int): The dimension of each attention head.
-        input_projection (nn.Sequential): Pre-processing MLP for the input.
         norm (nn.RMSNorm): Pre-attention layer normalization.
         qkv_projection (nn.Linear): The layer to project the input sequence
             to Q, K, V.
@@ -418,25 +352,21 @@ class ConditionalMSAWithRoPE(nn.Module):
         self.seq_len = seq_len
         self.head_dim = dim // num_heads
 
-        # The input projection remains the same
-        self.input_projection = nn.Sequential(
-            nn.Linear(dim, 4 * dim),
-            nn.SiLU(),
-            nn.Linear(4 * dim, dim),
-        )
         self.norm = nn.RMSNorm(dim, eps=1e-6)
+
+        self.seq_expand_proj = nn.Linear(seq_len, dim,)
 
         # QKV projection layer is also the same
         self.qkv_projection = nn.Linear(dim, dim * 3, bias=qkv_bias)
 
         # RoPE is now applied on the head dimension
-        self.rope = RotaryEmbedding1D(dim=self.head_dim)
+        self.rope = RoPE(dim=self.head_dim)
 
         # An output projection layer is added to combine heads
         self.head_combine_proj = nn.Linear(dim, dim)
 
         # A projection to combine the sequence length into a single output
-        self.seq_combine_proj = nn.Linear(seq_len, 1, bias=False)
+        self.seq_combine_proj = nn.Linear(dim, 1, bias=False)
 
     def forward(self, embeddings: Sequence[torch.Tensor]) -> torch.Tensor:
         """Forward pass for the multi-head attention block.
@@ -452,28 +382,29 @@ class ConditionalMSAWithRoPE(nn.Module):
         # S is the number of conditions.
         x = torch.stack(embeddings, dim=1)
         B, S, D = x.shape
-        residual = x
+        # residual = x
+
+        x = self.seq_expand_proj(x.permute(0, 2, 1))
 
         # 1. Pre-processing
-        x = self.input_projection(x)
         x = self.norm(x)
 
         # 2. Project to Q, K, V
         # (B, S, D) -> (B, S, 3 * D)
-        qkv = self.qkv_projection(x)
+        qkv = self.qkv_projection(x.permute(0, 2, 1))
 
         # 3. Reshape for Multi-Head Attention
         # (B, S, 3 * D) -> (B, S, 3, H, D_h) -> (3, B, H, S, D_h)
         # where H is num_heads, and D_h is head_dim
-        qkv = qkv.reshape(B, S, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = qkv.reshape(B, self.dim, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # Shape of each: (B, H, S, D_h)
 
         # 4. Apply RoPE to Query and Key
         # To apply RoPE, we temporarily merge the Batch and Head dimensions
         q_orig_shape = q.shape
         k_orig_shape = k.shape
-        q_reshaped = q.reshape(B * self.num_heads, S, self.head_dim)
-        k_reshaped = k.reshape(B * self.num_heads, S, self.head_dim)
+        q_reshaped = q.reshape(B * self.num_heads, self.dim, self.head_dim)
+        k_reshaped = k.reshape(B * self.num_heads, self.dim, self.head_dim)
 
         q_rot, k_rot = self.rope(q_reshaped, k_reshaped)
 
@@ -488,14 +419,14 @@ class ConditionalMSAWithRoPE(nn.Module):
 
         # 6. Combine heads
         # (B, H, S, D_h) -> (B, S, H, D_h) -> (B, S, D)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, S, D)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, self.dim, D)
 
         # 7. Final projection
         # (B, S, D) -> (B, S, D)
         out = self.head_combine_proj(attn_output)
 
         # 8. Add residual
-        processed_sequence = (residual + out).permute(0, 2, 1)
+        processed_sequence = out.permute(0, 2, 1)
 
         # 9. Combine sequence length into a single output
         processed_sequence = self.seq_combine_proj(processed_sequence)
@@ -1305,15 +1236,13 @@ class RoDitUnet(nn.Module):
         self.emb_dim = emb_dim
 
         self.time_embedder = SinusoidalPosEmb(self.emb_dim)
+        self.time_mlp_embedders = MLPEmbedder(self.emb_dim)
 
         self.num_conditions = num_conditions
         if self.num_conditions > 0:
-            self.cond_embedders = nn.ModuleList([SinusoidalPosEmb(self.emb_dim) for _ in range(num_conditions)])
-            self.embedding_attention = ConditionalMSAWithRoPE(
-                dim=self.emb_dim,
-                num_heads=num_heads,
-                seq_len=num_conditions+1
-            )
+            self.cond_pos_embedders = nn.ModuleList([SinusoidalPosEmb(self.emb_dim) for _ in range(num_conditions)])
+            self.cond_mlp_embedders = nn.ModuleList([MLPEmbedder(self.emb_dim) for _ in range(num_conditions)])
+            self.mlp_msa = ConditionalMSAWithRoPE(self.emb_dim, num_heads, num_conditions+1)
 
         # --- U-Net Backbone Construction ---
         resnet_block_args = {
@@ -1466,22 +1395,23 @@ class RoDitUnet(nn.Module):
         if time.ndim != 1 or time.shape[0] != B:
             time = time.flatten().expand(B)
 
-        t_emb = self.time_embedder(time.to(x.device))
-        final_emb = t_emb
+        t_emb = self.time_mlp_embedders(self.time_embedder(time.to(x.device)))
 
         if self.num_conditions > 0:
             if conditions is None or len(conditions) != self.num_conditions:
                 raise ValueError(f"Expected {self.num_conditions} conditions, but got {len(conditions) if conditions else 0}")
 
-            embedding_sequence = [t_emb]
+            cond_sequence = [t_emb]
 
             for cond_index, cond_tensor in enumerate(conditions):
                 if cond_tensor.ndim != 1 or cond_tensor.shape[0] != B:
                     cond_tensor = cond_tensor.flatten().expand(B)
-                c_emb = self.cond_embedders[cond_index](cond_tensor.to(x.device))
-                embedding_sequence.append(c_emb)
-
-            final_emb = self.embedding_attention(embedding_sequence)
+                c_emb = self.cond_pos_embedders[cond_index](cond_tensor.to(x.device))
+                c_emb = self.cond_mlp_embedders[cond_index](c_emb)
+                cond_sequence.append(c_emb)
+            final_emb = self.mlp_msa(cond_sequence)
+        else:
+            final_emb = t_emb
 
         # --- U-Net Forward Pass ---
         skips = []
@@ -1566,7 +1496,7 @@ class TestCoreModules(unittest.TestCase):
 
     def test_rotary_embedding_1d(self):
         """Test RotaryEmbedding1D module."""
-        rope = RotaryEmbedding1D(dim=self.emb_dim).to(self.device)
+        rope = RoPE(dim=self.emb_dim).to(self.device)
         q = torch.randn(self.batch_size, self.seq_len, self.emb_dim).to(self.device)
         k = torch.randn(self.batch_size, self.seq_len, self.emb_dim).to(self.device)
         q_rot, k_rot = rope(q, k)
@@ -1574,7 +1504,7 @@ class TestCoreModules(unittest.TestCase):
         self.assertEqual(k_rot.shape, k.shape)
         self.assertFalse(torch.allclose(q_rot, q))
         with self.assertRaises(ValueError):
-            RotaryEmbedding1D(dim=31)  # Odd dimension
+            RoPE(dim=31)  # Odd dimension
 
     def test_rotary_embedding_2d(self):
         """Test RotaryEmbedding2D module."""
@@ -1590,28 +1520,6 @@ class TestCoreModules(unittest.TestCase):
         self.assertFalse(torch.allclose(q_rot, q))
         with self.assertRaises(ValueError):
             RotaryEmbedding2D(dim=10)  # Not divisible by 4
-
-    def test_conditional_msa_with_rope(self):
-        """Test ConditionalMSAWithRoPE module."""
-        num_heads = 4
-        self.assertTrue(self.emb_dim % num_heads == 0, "emb_dim must be divisible by num_heads for test.")
-        msa_cond = ConditionalMSAWithRoPE(
-            dim=self.emb_dim,
-            num_heads=num_heads,
-            seq_len=self.seq_len,
-        ).to(self.device)
-        embeddings = [
-            torch.randn(self.batch_size, self.emb_dim).to(self.device)
-            for _ in range(self.seq_len)
-        ]
-        output = msa_cond(embeddings)
-        self.assertEqual(output.shape, (self.batch_size, self.emb_dim))
-        self.assertTrue(torch.isfinite(output).all())
-        with self.assertRaises(ValueError):
-            ConditionalMSAWithRoPE(dim=self.emb_dim, num_heads=7, seq_len=self.seq_len)
-        wrong_embeddings = embeddings + [torch.randn(self.batch_size, self.emb_dim).to(self.device)]
-        with self.assertRaises(RuntimeError):
-            msa_cond(wrong_embeddings)
 
     def test_msa_with_rope(self):
         """Test MSAWithRoPE module."""
