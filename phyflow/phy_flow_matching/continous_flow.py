@@ -519,7 +519,7 @@ class CFMExecutor:
 
         # Get model's predicted velocity $v(x_t, t, condition)$.
         model_output = self.model(
-            x=path_sample.x_t, time=path_sample.t, conditions=[temp,]
+            x=path_sample.x_t, time=path_sample.t, conditions=[1 + torch.exp(-0.5 * temp), 10 * torch.rand_like(temp)]
         )
 
         # Compute loss (e.g., MSE between predicted and target velocity).
@@ -1524,7 +1524,7 @@ class CFMExecutor:
                     x_init_batch = batch_content[0].to(self.device)
                     if len(batch_content) > 1:
                         temp = batch_content[1].to(self.device)
-                        current_model_extras['conditions'] = [temp,]
+                        current_model_extras['conditions'] = [1 + torch.exp(-0.5 * temp), 10 * torch.ones_like(temp)]
                 else:
                     x_init_batch = batch_content.to(self.device)
                     current_model_extras.pop('conditions', None) # Clear if not provided
