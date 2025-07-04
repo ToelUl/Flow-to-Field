@@ -539,6 +539,7 @@ class CFMExecutor:
         save_every_epochs: int = DEFAULT_SAVE_EVERY_EPOCHS,
         sigma_logit: float = 1.0,
         sigma_logit_increase_per_epoch: float = 0.0,
+        use_amp: bool = False,
     ) -> None:
         """Runs the main training loop.
 
@@ -556,6 +557,9 @@ class CFMExecutor:
             save_every_epochs: Frequency (in epochs) for saving checkpoints.
             sigma_logit: Initial value for the logit-normal sampler's standard deviation.
             sigma_logit_increase_per_epoch: Amount to increase the `sigma_logit`
+                after each epoch. This can help explore the time distribution
+                more effectively as training progresses.
+            use_amp: Whether to use Automatic Mixed Precision (AMP) for training.
 
         Raises:
             ValueError: If `gradient_accumulation_steps`, `num_epochs`, or
@@ -623,115 +627,119 @@ class CFMExecutor:
             "This controls the sampling distribution for time t."
         )
 
+        if use_amp:
+            logger.info(f"Using AMP device type: {self.device}")
+
         # --- Main Training Loop ---
-        for epoch in range(self.starting_epoch, num_epochs):
-            epoch_start_time = time.time()
-            self.model.train() # Ensure model is in training mode each epoch
-            running_epoch_loss = 0.0
-            processed_batches_in_epoch = 0
-            processed_batches_in_accum_cycle = 0
-            optimizer_steps_in_epoch = 0
-            last_clip_value_used = None
-            if epoch > self.starting_epoch: # Increase sigma_logit after the first epoch
-                if sigma_logit_increase_per_epoch != 0:
-                    sigma_logit += sigma_logit_increase_per_epoch
-                    logger.info(
-                        f"Increasing sigma_logit by {sigma_logit_increase_per_epoch:.4f} "
-                        f"for this epoch. New sigma_logit: {sigma_logit:.4f}"
-                    )
-                else:
-                    logger.info(
-                        f"Keeping sigma_logit = {sigma_logit:.4f} for this epoch."
-                    )
+        with torch.autocast(device_type=self.device, enabled=use_amp):
+            for epoch in range(self.starting_epoch, num_epochs):
+                epoch_start_time = time.time()
+                self.model.train() # Ensure model is in training mode each epoch
+                running_epoch_loss = 0.0
+                processed_batches_in_epoch = 0
+                processed_batches_in_accum_cycle = 0
+                optimizer_steps_in_epoch = 0
+                last_clip_value_used = None
+                if epoch > self.starting_epoch: # Increase sigma_logit after the first epoch
+                    if sigma_logit_increase_per_epoch != 0:
+                        sigma_logit += sigma_logit_increase_per_epoch
+                        logger.info(
+                            f"Increasing sigma_logit by {sigma_logit_increase_per_epoch:.4f} "
+                            f"for this epoch. New sigma_logit: {sigma_logit:.4f}"
+                        )
+                    else:
+                        logger.info(
+                            f"Keeping sigma_logit = {sigma_logit:.4f} for this epoch."
+                        )
 
-            # Create a batch iterator that randomly cycles through dataloaders
-            batch_iterator = multi_dataloader_random_cycle(
-                train_loaders, total_batches_per_epoch
-            )
-            progress_bar = tqdm(
-                batch_iterator,
-                total=total_batches_per_epoch,
-                desc=f"Epoch {epoch + 1}/{num_epochs}",
-                leave=False # Keep the bar nested under epoch logs
-            )
-
-            for batch_idx, batch_content in enumerate(progress_bar):
-                # Unpack data and label, providing a default label if not present
-                if isinstance(batch_content, (list, tuple)) and len(batch_content) == 2:
-                    data_batch, label_batch = batch_content
-                else:
-                    data_batch = batch_content
-                    # Default label (e.g., for unconditional models or if labels are implicit)
-                    label_batch = torch.zeros(data_batch.shape[0], dtype=torch.long)
-
-                step_loss = self._train_step(
-                    data_batch,
-                    label_batch,
-                    prob_path,
-                    gradient_accumulation_steps,
-                    sigma_logit=sigma_logit
+                # Create a batch iterator that randomly cycles through dataloaders
+                batch_iterator = multi_dataloader_random_cycle(
+                    train_loaders, total_batches_per_epoch
                 )
-                running_epoch_loss += step_loss
-                processed_batches_in_epoch += 1
-                processed_batches_in_accum_cycle += 1
+                progress_bar = tqdm(
+                    batch_iterator,
+                    total=total_batches_per_epoch,
+                    desc=f"Epoch {epoch + 1}/{num_epochs}",
+                    leave=False # Keep the bar nested under epoch logs
+                )
 
-                # Perform optimizer step after accumulating gradients or if it's the last batch
-                is_last_batch_in_epoch = (batch_idx + 1) == total_batches_per_epoch
-                if (processed_batches_in_accum_cycle == gradient_accumulation_steps or
-                        is_last_batch_in_epoch):
+                for batch_idx, batch_content in enumerate(progress_bar):
+                    # Unpack data and label, providing a default label if not present
+                    if isinstance(batch_content, (list, tuple)) and len(batch_content) == 2:
+                        data_batch, label_batch = batch_content
+                    else:
+                        data_batch = batch_content
+                        # Default label (e.g., for unconditional models or if labels are implicit)
+                        label_batch = torch.zeros(data_batch.shape[0], dtype=torch.long)
 
-                    # Apply adaptive gradient clipping before the optimizer step
-                    clip_val = self.auto_clipper()
-                    if clip_val is not None:
-                        last_clip_value_used = clip_val
-
-                    self.optimizer.step()
-                    self.optimizer.zero_grad() # Reset gradients for the next accumulation cycle
-                    optimizer_steps_in_epoch += 1
-                    processed_batches_in_accum_cycle = 0 # Reset accumulation counter
-
-                # Update progress bar postfix with current stats
-                if (batch_idx + 1) % 10 == 0 or is_last_batch_in_epoch:
-                    current_avg_loss = running_epoch_loss / processed_batches_in_epoch \
-                                       if processed_batches_in_epoch > 0 else 0.0
-                    postfix_str = (
-                        f'Avg Loss: {current_avg_loss:.4f}, '
-                        f'LR: {self.optimizer.param_groups[0]["lr"]:.6f}'
+                    step_loss = self._train_step(
+                        data_batch,
+                        label_batch,
+                        prob_path,
+                        gradient_accumulation_steps,
+                        sigma_logit=sigma_logit
                     )
-                    if last_clip_value_used is not None:
-                        postfix_str += f', Clip: {last_clip_value_used:.2f}'
-                    progress_bar.set_postfix_str(postfix_str)
+                    running_epoch_loss += step_loss
+                    processed_batches_in_epoch += 1
+                    processed_batches_in_accum_cycle += 1
 
-            # --- End of Epoch ---
-            epoch_end_time = time.time()
-            epoch_duration = epoch_end_time - epoch_start_time
-            average_epoch_loss = running_epoch_loss / total_batches_per_epoch \
-                                 if total_batches_per_epoch > 0 else 0.0
-            self.epoch_losses.append(average_epoch_loss)
+                    # Perform optimizer step after accumulating gradients or if it's the last batch
+                    is_last_batch_in_epoch = (batch_idx + 1) == total_batches_per_epoch
+                    if (processed_batches_in_accum_cycle == gradient_accumulation_steps or
+                            is_last_batch_in_epoch):
 
-            logger.info(f"Epoch {epoch + 1}/{num_epochs} completed in {epoch_duration:.2f}s.")
-            logger.info(f"  Average Epoch Loss: {average_epoch_loss:.4f}")
-            logger.info(f"  Optimizer steps in epoch: {optimizer_steps_in_epoch}")
-            if last_clip_value_used is not None:
+                        # Apply adaptive gradient clipping before the optimizer step
+                        clip_val = self.auto_clipper()
+                        if clip_val is not None:
+                            last_clip_value_used = clip_val
+
+                        self.optimizer.step()
+                        self.optimizer.zero_grad() # Reset gradients for the next accumulation cycle
+                        optimizer_steps_in_epoch += 1
+                        processed_batches_in_accum_cycle = 0 # Reset accumulation counter
+
+                    # Update progress bar postfix with current stats
+                    if (batch_idx + 1) % 10 == 0 or is_last_batch_in_epoch:
+                        current_avg_loss = running_epoch_loss / processed_batches_in_epoch \
+                                           if processed_batches_in_epoch > 0 else 0.0
+                        postfix_str = (
+                            f'Avg Loss: {current_avg_loss:.4f}, '
+                            f'LR: {self.optimizer.param_groups[0]["lr"]:.6f}'
+                        )
+                        if last_clip_value_used is not None:
+                            postfix_str += f', Clip: {last_clip_value_used:.2f}'
+                        progress_bar.set_postfix_str(postfix_str)
+
+                # --- End of Epoch ---
+                epoch_end_time = time.time()
+                epoch_duration = epoch_end_time - epoch_start_time
+                average_epoch_loss = running_epoch_loss / total_batches_per_epoch \
+                                     if total_batches_per_epoch > 0 else 0.0
+                self.epoch_losses.append(average_epoch_loss)
+
+                logger.info(f"Epoch {epoch + 1}/{num_epochs} completed in {epoch_duration:.2f}s.")
+                logger.info(f"  Average Epoch Loss: {average_epoch_loss:.4f}")
+                logger.info(f"  Optimizer steps in epoch: {optimizer_steps_in_epoch}")
+                if last_clip_value_used is not None:
+                    logger.info(
+                        f"  Last AutoClip threshold used: {last_clip_value_used:.4f}"
+                    )
+
+                self.lr_scheduler.step() # Step the learning rate scheduler
                 logger.info(
-                    f"  Last AutoClip threshold used: {last_clip_value_used:.4f}"
+                    f"  LR scheduler stepped. New LR: {self.optimizer.param_groups[0]['lr']:.6f}"
                 )
 
-            self.lr_scheduler.step() # Step the learning rate scheduler
-            logger.info(
-                f"  LR scheduler stepped. New LR: {self.optimizer.param_groups[0]['lr']:.6f}"
-            )
-
-            # Save checkpoint periodically or at the end of training
-            if (epoch + 1) % save_every_epochs == 0 or (epoch + 1) == num_epochs:
-                autoclipper_state = self.auto_clipper.grad_history \
-                                    if hasattr(self, 'auto_clipper') else None
-                self.save_checkpoint(
-                    epoch=epoch + 1, # Epochs are 1-indexed for saving
-                    loss_history=self.epoch_losses,
-                    autoclipper_state=autoclipper_state
-                )
-            logger.info("-" * 60) # Separator for readability
+                # Save checkpoint periodically or at the end of training
+                if (epoch + 1) % save_every_epochs == 0 or (epoch + 1) == num_epochs:
+                    autoclipper_state = self.auto_clipper.grad_history \
+                                        if hasattr(self, 'auto_clipper') else None
+                    self.save_checkpoint(
+                        epoch=epoch + 1, # Epochs are 1-indexed for saving
+                        loss_history=self.epoch_losses,
+                        autoclipper_state=autoclipper_state
+                    )
+                logger.info("-" * 60) # Separator for readability
 
         logger.info("Training finished.")
         self._plot_and_save_loss(plot_filename=self.LOSS_PLOT_FILENAME)
@@ -1684,7 +1692,7 @@ class CFMExecutor:
         except Exception as e: # pragma: no cover
             logger.error(f"Failed to save checkpoint to {checkpoint_save_path}: {e}")
 
-    def load_checkpoint(self, checkpoint_path: str, new_ntk_alpha: float=None) -> None:
+    def load_checkpoint(self, checkpoint_path: str) -> None:
         """Loads state from a checkpoint file to resume training or for inference.
 
         This method loads the model weights, optimizer state, learning rate
@@ -1693,7 +1701,6 @@ class CFMExecutor:
 
         Args:
             checkpoint_path: Path to the checkpoint file (.pth).
-            new_ntk_alpha: Optional new alpha value for inference. If provided,
 
         Raises:
             FileNotFoundError: If the checkpoint file does not exist.
@@ -1716,29 +1723,7 @@ class CFMExecutor:
             checkpoint = torch.load(load_path, map_location=self.device, weights_only=False)
 
             # --- Load core states ---
-            if new_ntk_alpha is not None and hasattr(self.model, 'middle_blocks'):
-                new_inv_freq_target = self.model.middle_blocks[0].attn.rope.inv_freq_x.clone()
-                logger.info(
-                    f"New alpha for inference: {new_ntk_alpha}"
-                )
-                logger.info(
-                    f"Target 'inv_freq_x' for new alpha: {new_inv_freq_target}"
-                )
-                source_state_dict = checkpoint['model_state_dict']
-                target_state_dict = self.model.state_dict()
-                state_to_load = {}
-                for k, v in source_state_dict.items():
-                    if 'rope.inv_freq_x' not in k and 'rope.inv_freq_y' not in k:
-                        state_to_load[k] = v
-                target_state_dict.update(state_to_load)
-                self.model.load_state_dict(target_state_dict)
-                logger.info("Model state_dict updated and loaded successfully.")
-                logger.info("--- Verifying the results ---")
-                loaded_inv_freq = self.model.middle_blocks[0].attn.rope.inv_freq_x
-                assert torch.equal(new_inv_freq_target, loaded_inv_freq)
-                logger.info("✅ Verification PASSED: 'inv_freq_x' buffer retains the value from the new alpha.")
-            else:
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.load_state_dict(checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
 
