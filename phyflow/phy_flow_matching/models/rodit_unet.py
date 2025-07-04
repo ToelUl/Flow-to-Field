@@ -37,7 +37,8 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 # ==============================================================================
 # Core Modules
 # ==============================================================================
-@torch.compile
+# @torch.compile
+@torch.compiler.disable(recursive=True)
 class SinusoidalPosEmb(nn.Module):
     """Creates sinusoidal positional embeddings.
 
@@ -68,6 +69,12 @@ class SinusoidalPosEmb(nn.Module):
         self.embedding_dim = embedding_dim
         self.max_period = max_period
 
+        half_dim = self.embedding_dim // 2
+        freqs = torch.exp(
+            -math.log(self.max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32) / half_dim
+        )
+        self.register_buffer('freqs', freqs, persistent=False) # persistent=False 可選，若不需儲存到 state_dict
+
     def forward(self, x: Tensor) -> Tensor:
         """Generates the positional embeddings for the input tensor.
 
@@ -81,19 +88,16 @@ class SinusoidalPosEmb(nn.Module):
         """
         if x.ndim != 1:
             x = x.flatten()
-        half_dim = self.embedding_dim // 2
-        freqs = torch.exp(
-            -math.log(self.max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32) / half_dim
-        ).to(x.device)
-        args = x.float().unsqueeze(1) * freqs.unsqueeze(0)
+
+        args = x.float().unsqueeze(1) * self.freqs.unsqueeze(0)
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
 
-# @torch.compile
-@torch.compiler.disable(recursive=True)
+# @torch.compiler.disable(recursive=True)
+@torch.compile
 class MLPEmbedder(nn.Module):
     """
-    一個簡單的 MLP (多層感知機)，用於將各種嵌入(如時間步、引導強度)投影到模型的隱藏維度。
+    A Multi-Layer Perceptron (MLP) embedder for input features.
     """
     def __init__(self, in_dim: int):
         super().__init__()
@@ -110,39 +114,185 @@ class MLPEmbedder(nn.Module):
 
 @torch.compile
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dimensions of the input tensor.
+
+    This function is a core component of Rotary Position Embedding. It splits the
+    last dimension of the input tensor into two halves, negates the second half,
+    and then concatenates them in a swapped order.
+
+    Args:
+        x (torch.Tensor): The input tensor. Can be of any shape, but the last
+            dimension must be even.
+
+    Returns:
+        torch.Tensor: The tensor with half of its last dimension values rotated.
+    """
+    # Reshape the last dimension to (..., -1, 2)
     x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
-    x_rotated_pairs = torch.cat([-x_reshaped[..., 1:], x_reshaped[..., :1]], dim=-1)
-    return x_rotated_pairs.flatten(start_dim=2)
+    # Swap the two halves and negate the first one (which was the second half).
+    x_rotated_pairs = torch.cat(
+        [-x_reshaped[..., 1:], x_reshaped[..., :1]], dim=-1
+    )
+    # Flatten the last two dimensions back to the original dimension size.
+    return x_rotated_pairs.flatten(start_dim=-2)
+
 
 @torch.compile
 class RoPE(nn.Module):
+    """Implements the Rotary Position Embedding (RoPE).
+
+    RoPE is a type of positional embedding that encodes the absolute position
+    of a token by rotating its embedding vector. It has gained popularity in
+    transformer-based models for its ability to handle variable sequence lengths
+    and its improved performance over other positional encoding methods.
+
+    This module precomputes the inverse frequencies required for the rotation
+    at initialization and applies the rotation to query (q) and key (k) tensors
+    during the forward pass.
+
+    Attributes:
+        dim (int): The feature dimension of the input tensors, which must be even.
+        base (int): The base value used for calculating the inverse frequencies.
+        inv_freq (torch.Tensor): A non-trainable buffer holding the precomputed
+            inverse frequencies.
+    """
     def __init__(self, dim: int, base: int = 10000):
+        """Initializes the RoPE module.
+
+        Args:
+            dim (int): The dimension of the features to be rotated. Must be an
+                even number.
+            base (int, optional): The base for the geometric progression of
+                frequencies. Defaults to 10000.
+
+        Raises:
+            ValueError: If the provided `dim` is not an even number.
+        """
         super().__init__()
         if dim % 2 != 0:
             raise ValueError(f"Dimension must be even for 1D RoPE, but got {dim}.")
 
         self.dim = dim
         self.base = base
+        # Calculate the frequencies for the sinusoidal embeddings.
         freqs = torch.arange(0, dim, 2, dtype=torch.float32) / dim
+        # Calculate the inverse frequencies using the base.
         inv_freq = 1.0 / (self.base**freqs)
+        # Register `inv_freq` as a buffer so it's part of the module's state,
+        # but not considered a model parameter.
         self.register_buffer("inv_freq", inv_freq)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Applies Rotary Position Embedding to the query and key tensors.
+
+        Args:
+            q (torch.Tensor): The query tensor of shape (batch_size, seq_len, dim).
+            k (torch.Tensor): The key tensor of shape (batch_size, seq_len, dim).
+
+        Returns:
+            A tuple containing the rotated query and key tensors, both of the
+            same shape as the input tensors.
+        """
         seq_len = q.shape[1]
         device = q.device
 
-        # 1. 計算每個位置的角度
+        # 1. Calculate the positional angles.
+        # Create a tensor of positions [0, 1, ..., seq_len - 1].
         positions = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", positions, self.inv_freq) # Shape: (seq_len, dim / 2)
+        # Use einsum to get the outer product of positions and inverse frequencies,
+        # resulting in a shape of (seq_len, dim / 2).
+        freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
 
-        # 2. 計算 cos 和 sin 值
+        # 2. Compute cosine and sine values for the rotations.
         cos_vals = freqs.cos()
         sin_vals = freqs.sin()
 
-        # 3. 為了廣播 (broadcast)，將 cos 和 sin 的形狀從 (L, D/2) 擴展到 (1, L, D)
-        #    repeat_interleave 會將 [c1, c2, c3] 變為 [c1, c1, c2, c2, c3, c3]
+        # 3. Expand cos and sin for broadcasting to match the input tensor shape.
+        # The shape is expanded from (seq_len, dim / 2) to (1, seq_len, dim)
+        # by repeating each value. e.g., [c1, c2] -> [c1, c1, c2, c2].
         cos = cos_vals.repeat_interleave(2, dim=-1).unsqueeze(0)
         sin = sin_vals.repeat_interleave(2, dim=-1).unsqueeze(0)
+
+        # Apply the rotation to query and key tensors using the RoPE formula.
+        rotated_q = q * cos + rotate_half(q) * sin
+        rotated_k = k * cos + rotate_half(k) * sin
+
+        return rotated_q, rotated_k
+
+
+@torch.compile
+class RoPE_Mixed(nn.Module):
+    """Implements the mixed-axis Rotary Position Embedding (RoPE-Mixed).
+
+    This module applies rotary position embeddings to 2D feature maps, as
+    proposed in the paper "Rotary Position Embedding for Vision Transformer".
+    It uses learnable frequencies that mix both y and x axes to encode
+    positional information.
+
+    This implementation assumes the input tensors are in a shape that includes
+    (H, W, D) as the trailing dimensions, e.g., (B, H, W, D) or
+    (B, NumHeads, H, W, HeadDim).
+
+    Attributes:
+        freqs (nn.Parameter): A learnable parameter of shape (D/2, 2) that
+            stores the frequencies (theta_y, theta_x) for the y and x axes.
+    """
+
+    def __init__(self, dim: int):
+        """Initializes the RoPE_Mixed module.
+
+        Args:
+            dim (int): The feature dimension (D) of the input tensors.
+                Must be an even number.
+        """
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"Dimension must be even, but got {dim}")
+        self.freqs = nn.Parameter(torch.randn(dim // 2, 2))
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Applies the RoPE-Mixed transformation to query and key tensors.
+
+        Args:
+            q (torch.Tensor): The query tensor, e.g., (B, H, W, D).
+            k (torch.Tensor): The key tensor, with the same shape as q.
+
+        Returns:
+            A tuple containing the rotated query and key tensors, with their
+            shapes preserved.
+        """
+        device = q.device
+        # The last three dimensions are assumed to be H, W, D
+        H, W, D = q.shape[-3:]
+
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(H, device=device, dtype=self.freqs.dtype),
+            torch.arange(W, device=device, dtype=self.freqs.dtype),
+            indexing="ij",
+        )
+        positions_2d = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=-1)
+
+        theta_y = self.freqs[:, 0]
+        theta_x = self.freqs[:, 1]
+        angles = torch.einsum("n,d->nd", positions_2d[:, 0], theta_y) + torch.einsum(
+            "n,d->nd", positions_2d[:, 1], theta_x
+        )
+
+        cos_vals = angles.cos()
+        sin_vals = angles.sin()
+
+        # Reshape for broadcasting. The leading dimensions of cos/sin will be (1, 1, ...).
+        # Final shape will be (1, ..., 1, H, W, D) to match any number of batch dimensions.
+        cos = cos_vals.repeat_interleave(2, dim=-1).reshape(H, W, D)
+        sin = sin_vals.repeat_interleave(2, dim=-1).reshape(H, W, D)
+        # Add leading dimensions for broadcasting over batch & heads
+        while cos.dim() < q.dim():
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
 
         rotated_q = q * cos + rotate_half(q) * sin
         rotated_k = k * cos + rotate_half(k) * sin
@@ -150,159 +300,8 @@ class RoPE(nn.Module):
         return rotated_q, rotated_k
 
 
-@torch.compiler.disable(recursive=True)
-class RotaryEmbedding2D(nn.Module):
-    """Implements 2D Rotary Positional Embedding (RoPE).
-
-    This module applies rotary embeddings to the query and key tensors, encoding
-    positional information by rotating feature vectors based on their 2D
-    coordinates. The embedding dimension is split to encode x and y coordinates
-    independently. It includes a caching mechanism to avoid recomputing sinusoidal
-    values for inputs of the same spatial dimensions.
-
-    Attributes:
-        dim (int): The feature dimension of each attention head. Must be divisible
-            by 4.
-        base (int): The base for the geometric progression of frequencies.
-        alpha (float): The NTK interpolation scaling factor. Defaults to 1.0 (no scaling).
-        inv_freq_x (torch.Tensor): The inverse frequencies for the x-dimension.
-        inv_freq_y (torch.Tensor): The inverse frequencies for the y-dimension.
-    """
-
-    def __init__(self, dim: int, base: int = 10000, alpha: float = 1.0):
-        """Initializes the RotaryEmbedding2D module.
-
-        Args:
-            dim (int): The feature dimension per head. Must be an even number and
-                divisible by 4.
-            base (int): The base value for the frequency calculation.
-            alpha (float): The NTK interpolation scaling factor. Defaults to 1.0 (no scaling).
-
-        Raises:
-            ValueError: If `dim` is not divisible by 4.
-        """
-        super().__init__()
-        if dim % 4 != 0:
-            raise ValueError(
-                f"Dimension must be divisible by 4 for 2D RoPE, but got {dim}.")
-
-        self.dim = dim
-        self.base = base
-        self.alpha = alpha
-
-        # Calculate inverse frequencies for x and y dimensions.
-        # The dimension is split in half for x and y, and each half is further
-        # split for sine and cosine components.
-        dim_half = self.dim // 2
-        freqs_for_half = torch.arange(0, dim_half, 2).float() / dim_half
-
-        # Apply NTK scaling to the base if alpha is not 1.0
-        # A larger alpha leads to a larger base, which results in smaller frequencies (longer wavelengths),
-        # allowing the model to handle larger positions.
-        scaled_base = self.base * (
-                self.alpha ** (dim_half / (dim_half - 2.0 + 1e-6))
-        ) if self.alpha != 1.0 and dim_half != 2.0 else self.base
-
-        inv_freq = 1.0 / (scaled_base**freqs_for_half)
-
-        self.register_buffer("inv_freq_x", inv_freq)
-        self.register_buffer("inv_freq_y", inv_freq)
-
-        # Caching attributes
-        self._cached_cos: Tensor | None = None
-        self._cached_sin: Tensor | None = None
-        self._cached_seq_shape: Tuple[int, int] | None = None
-
-    def _update_cache(self, height: int, width: int, device: torch.device):
-        """Updates the cached sinusoidal embeddings if the sequence shape changes.
-
-        Args:
-            height (int): The height of the input feature map.
-            width (int): The width of the input feature map.
-            device (torch.device): The device of the input tensor.
-        """
-        seq_shape = (height, width)
-        if seq_shape == self._cached_seq_shape:
-            return
-
-        self._cached_seq_shape = seq_shape
-
-        pos_y = torch.arange(height, device=device, dtype=torch.float32)
-        pos_x = torch.arange(width, device=device, dtype=torch.float32)
-
-        # Calculate frequency components for each position.
-        freqs_y = torch.einsum("i,j->ij", pos_y, self.inv_freq_y)
-        freqs_x = torch.einsum("i,j->ij", pos_x, self.inv_freq_x)
-
-        # Interleave for sine and cosine application.
-        freqs_y = freqs_y.repeat_interleave(2, dim=-1)
-        freqs_x = freqs_x.repeat_interleave(2, dim=-1)
-
-        # Combine y and x frequencies. Shape: (H, W, dim).
-        freqs = torch.cat([
-            freqs_y.unsqueeze(1).expand(-1, width, -1),
-            freqs_x.unsqueeze(0).expand(height, -1, -1)
-        ], dim=-1)
-
-        # Flatten and reshape for broadcasting. Shape: (1, H*W, 1, dim).
-        freqs = freqs.flatten(0, 1).unsqueeze(0).unsqueeze(2)
-
-        self._cached_cos = freqs.cos()
-        self._cached_sin = freqs.sin()
-
-    def _apply_rotary_embedding(self, x: Tensor) -> Tensor:
-        """Applies the pre-computed rotary embeddings to the input tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor (query or key) of shape
-                (Batch, SeqLen, NumHeads, HeadDim).
-
-        Returns:
-            torch.Tensor: The tensor with rotary positional embeddings applied.
-        """
-        # x_rotated = (-x2, x1) * sin + (x1, x2) * cos
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
-
-        # Ensure cached tensors are available.
-        if self._cached_cos is None or self._cached_sin is None:
-            raise RuntimeError(
-                "Cache is not initialized. Call _update_cache first.")
-
-        # Apply rotation using broadcasted sin/cos values.
-        rotated_x1 = x1 * self._cached_cos[..., 0::2] - x2 * self._cached_sin[..., 0::2]
-        rotated_x2 = x1 * self._cached_sin[..., 0::2] + x2 * self._cached_cos[..., 0::2]
-
-        # Reassemble the tensor.
-        rotated_x = torch.empty_like(x)
-        rotated_x[..., 0::2] = rotated_x1
-        rotated_x[..., 1::2] = rotated_x2
-
-        return rotated_x
-
-    def forward(self, q: Tensor, k: Tensor, height: int,
-                width: int) -> Tuple[Tensor, Tensor]:
-        """Applies 2D RoPE to query and key tensors.
-
-        Args:
-            q (torch.Tensor): Query tensor of shape
-                (Batch, SeqLen, NumHeads, HeadDim).
-            k (torch.Tensor): Key tensor of shape
-                (Batch, SeqLen, NumHeads, HeadDim).
-            height (int): The height of the original spatial feature map.
-            width (int): The width of the original spatial feature map.
-
-        Returns:
-            A tuple containing the rotated query and key tensors.
-        """
-        self._update_cache(height, width, q.device)
-        rotated_q = self._apply_rotary_embedding(q)
-        rotated_k = self._apply_rotary_embedding(k)
-
-        return rotated_q, rotated_k
-
-
-@torch.compiler.disable(recursive=True)
+# @torch.compiler.disable(recursive=True)
+@torch.compile
 class ConditionalMSAWithRoPE(nn.Module):
     """A Multi-Head Self-Attention block for fusing conditional embeddings
     with RoPE.
@@ -434,29 +433,27 @@ class ConditionalMSAWithRoPE(nn.Module):
         return processed_sequence.squeeze(-1)
 
 
+@torch.compile
 class MSAWithRoPE(nn.Module):
-    """A Multi-Head Self-Attention module integrated with 2D RoPE.
+    """A Multi-Head Self-Attention module integrated with RoPE-Mixed.
 
     This module computes self-attention on a 2D feature map. It uses a
     depthwise separable convolution for efficient QKV projection and integrates
-    2D Rotary Positional Embedding (RoPE) to provide positional awareness to the
-    attention mechanism.
+    RoPE-Mixed to provide positional awareness to the attention mechanism.
 
     Attributes:
         is_identity (bool): If True, the module acts as an identity function.
-            This is true when the input channel count is zero.
         num_heads (int): The number of attention heads.
         head_dim (int): The dimension of each attention head.
         scale (float): The scaling factor for the dot product.
         qkv_projection (nn.Module): The layer to project input to Q, K, V.
-        rope (RotaryEmbedding2D): The 2D rotary embedding module.
+        rope (RoPE_Mixed): The mixed-axis rotary embedding module.
     """
     def __init__(self,
                  channels: int,
                  num_heads: int = 4,
                  qkv_bias: bool = False,
                  padding_mode: str = "circular",
-                 alpha: float = 1.0
                  ):
         """Initializes the MSAWithRoPE module.
 
@@ -468,11 +465,10 @@ class MSAWithRoPE(nn.Module):
                 projection.
             padding_mode (str): The padding mode for the QKV projection's
                 convolution. Typically 'zeros' or 'circular'.
-            alpha (float): The NTK interpolation scaling factor for RoPE.
 
         Raises:
             AssertionError: If `channels` is not divisible by `num_heads` or if
-                the resulting `head_dim` is not divisible by 4 (a RoPE requirement).
+                the resulting `head_dim` is not divisible by 2.
         """
         super().__init__()
         if channels <= 0:
@@ -487,8 +483,9 @@ class MSAWithRoPE(nn.Module):
         self.head_dim = channels // self.num_heads
         self.scale = self.head_dim**-0.5
 
-        assert self.head_dim % 4 == 0, (
-            f"Head dimension ({self.head_dim}) must be divisible by 4 for 2D RoPE.")
+        # RoPE_Mixed only requires the dimension to be even.
+        assert self.head_dim % 2 == 0, (
+            f"Head dimension ({self.head_dim}) must be even for RoPE-Mixed.")
 
         self.qkv_projection = nn.Conv2d(
             in_channels=channels,
@@ -500,7 +497,7 @@ class MSAWithRoPE(nn.Module):
             groups=channels  # Depthwise convolution
         )
 
-        self.rope = RotaryEmbedding2D(dim=self.head_dim, base=channels, alpha=alpha)
+        self.rope = RoPE_Mixed(dim=self.head_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         """Defines the forward pass for the attention module.
@@ -509,8 +506,7 @@ class MSAWithRoPE(nn.Module):
             x (torch.Tensor): The input tensor of shape (B, C, H, W).
 
         Returns:
-            torch.Tensor: The output tensor with the same shape as the input,
-                after applying attention and adding a residual connection.
+            torch.Tensor: The output tensor with the same shape as the input.
         """
         if self.is_identity:
             return x
@@ -518,30 +514,36 @@ class MSAWithRoPE(nn.Module):
         B, C, H, W = x.shape
         N = H * W  # Sequence length
 
-        # 1. Project to Q, K, V and reshape for multi-head attention.
+        # 1. Project to Q, K, V.
         qkv = self.qkv_projection(x).chunk(3, dim=1)
         q, k, v = map(
-            lambda t: t.view(B, self.num_heads, self.head_dim, N).transpose(-1, -2),
+            lambda t: t.view(B, self.num_heads, self.head_dim, H, W),
             qkv
-        ) # Shape of q, k, v: (B, num_heads, N, head_dim)
+        )
 
-        # 2. Reshape and apply 2D Rotary Positional Embedding to Q and K.
-        # Permute to (B, N, num_heads, head_dim) for RoPE.
-        q_for_rope = q.permute(0, 2, 1, 3)
-        k_for_rope = k.permute(0, 2, 1, 3)
+        # 2. Reshape and apply RoPE-Mixed to Q and K.
+        # RoPE_Mixed expects inputs of shape (..., H, W, D).
+        # We permute from (B, num_heads, head_dim, H, W) to (B, num_heads, H, W, head_dim).
+        q_for_rope = q.permute(0, 1, 3, 4, 2)
+        k_for_rope = k.permute(0, 1, 3, 4, 2)
 
-        q_rotated, k_rotated = self.rope(q_for_rope, k_for_rope, height=H, width=W)
+        q_rotated, k_rotated = self.rope(q_for_rope, k_for_rope)
 
-        # Permute back to (B, num_heads, N, head_dim) for attention.
-        q = q_rotated.permute(0, 2, 1, 3)
-        k = k_rotated.permute(0, 2, 1, 3)
+        # 3. Reshape for attention calculation.
+        # The attention function expects (B, num_heads, SeqLen, head_dim).
+        q_attn = q_rotated.view(B, self.num_heads, N, self.head_dim)
+        k_attn = k_rotated.view(B, self.num_heads, N, self.head_dim)
+        v_attn = v.contiguous().view(B, self.num_heads, N, self.head_dim)
 
-        # 3. Compute scaled dot-product attention.
-        out = F.scaled_dot_product_attention(q, k, v)
+        # 4. Compute scaled dot-product attention.
+        out = F.scaled_dot_product_attention(q_attn, k_attn, v_attn)
 
-        return x + out.transpose(-1, -2).reshape(B, C, H, W)
+        # Reshape output back to (B, C, H, W) and add residual connection.
+        out = out.transpose(-1, -2).reshape(B, C, H, W)
+        return x + out
 
 
+@torch.compile
 class Mlp(nn.Module):
     """Multi-Layer Perceptron for spatial features.
 
@@ -596,7 +598,7 @@ class Mlp(nn.Module):
 
 
 @torch.compile
-class RoDitBlock(nn.Module):
+class AttentionResnetBlock(nn.Module):
     """A Diffusion transformer like convolutional block with rotary embeddings.
 
     This block forms the main building block of the U-Net at deeper levels. It
@@ -623,9 +625,8 @@ class RoDitBlock(nn.Module):
         num_groups: int = 4,
         dropout: float = 0.0,
         padding_mode: str = "circular",
-        alpha: float = 1.0,
     ):
-        """Initializes the RoDitBlock.
+        """Initializes the AttentionResnetBlock.
 
         Args:
             channels: Number of input and output channels.
@@ -635,7 +636,6 @@ class RoDitBlock(nn.Module):
                 divisor of `channels`.
             dropout: Dropout rate for the MLP block.
             padding_mode: Padding mode for convolutions.
-            alpha: NTK interpolation scaling factor for RoPE. Defaults to 1.0 (no scaling).
         """
         super().__init__()
         self.channels = channels
@@ -653,7 +653,6 @@ class RoDitBlock(nn.Module):
             channels=self.channels,
             num_heads=num_heads,
             padding_mode=padding_mode,
-            alpha=alpha,
         )
         self.norm2 = nn.GroupNorm(num_groups, channels, affine=False, eps=1e-6)
         self.mlp = Mlp(
@@ -671,7 +670,7 @@ class RoDitBlock(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        """Forward pass for the RoDitBlock.
+        """Forward pass for the AttentionResnetBlock.
 
         Args:
             x: Input tensor of shape (B, C, H, W).
@@ -772,7 +771,7 @@ class ResnetBlock(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        """Forward pass for the RoDitBlock.
+        """Forward pass for the ResnetBlock.
 
         Args:
             x: Input tensor of shape (B, C, H, W).
@@ -1112,7 +1111,10 @@ class ConditionalUpsample(nn.Module):
     options={
         "max_autotune": True,
         "epilogue_fusion": True,
+        "shape_padding": True,
         "triton.cudagraphs": True,
+        # "fallback_random": True,
+        # "trace.enabled": True,
     }
 )
 class RoDitUnet(nn.Module):
@@ -1126,10 +1128,10 @@ class RoDitUnet(nn.Module):
     next level. This approach markedly reduces the parameter count and computational
     load, making the model inherently lighter and faster.
 
-    It uses RoDitBlock as the main building block and supports time and conditional
+    It uses AttentionResnetBlock as the main building block and supports time and conditional
     embeddings. The `start_attn_level` parameter complements the efficiency-focused
     design by allowing the use of ResnetBlocks for shallower layers and switching to
-    RoDitBlocks (with self-attention) at deeper levels, further balancing performance
+    AttentionResnetBlocks (with self-attention) at deeper levels, further balancing performance
     and computational cost.
 
     Attributes:
@@ -1147,16 +1149,15 @@ class RoDitUnet(nn.Module):
             - **The final element (4)** is for the bottleneck's channel multiplier.
             Note: The blocks at a given level `i` do *not* operate on `model_channels * downsample_out_ch_mult[i]`.
         start_attn_level: The level index (0-based) at which to start using
-            RoDitBlocks. Layers before this level will use ResnetBlocks.
+            AttentionResnetBlocks. Layers before this level will use ResnetBlocks.
         num_blocks: The number of Backbone Block at each level.
-        dropout: The dropout rate used in the RoDitBlock.
-        num_heads: The number of attention heads in the RoDitBlock.
-        num_groups: The number of groups for GroupNorm in the RoDitBlock.
+        dropout: The dropout rate used in the AttentionResnetBlock.
+        num_heads: The number of attention heads in the AttentionResnetBlock.
+        num_groups: The number of groups for GroupNorm in the AttentionResnetBlock.
         num_conditions: The number of conditions (e.g., time embeddings).
         emb_dim: The dimension of the time and conditional embeddings passed to
-            the RoDitBlock. Defaults to `model_channels`.
+            the AttentionResnetBlock. Defaults to `model_channels`.
         padding_mode: The padding mode for all convolutions.
-        alpha: The NTK interpolation scaling factor for RoPE. Defaults to 1.0 (no scaling).
     """
 
     def __init__(
@@ -1173,7 +1174,6 @@ class RoDitUnet(nn.Module):
             num_conditions: int = 0,
             emb_dim: Optional[int] = None,
             padding_mode: str = "circular",
-            alpha: float = 1.0
     ):
         """Initializes the RoDitUnet model.
 
@@ -1192,17 +1192,16 @@ class RoDitUnet(nn.Module):
                 - **The final element (4)** is for the bottleneck's channel multiplier.
                 Note: The blocks at a given level `i` do *not* operate on `model_channels * downsample_out_ch_mult[i]`.
             start_attn_level (int): The level index (0-based) at which to start
-                using RoDitBlocks. Layers before this level will use ResnetBlocks.
+                using AttentionResnetBlocks. Layers before this level will use ResnetBlocks.
                 Defaults to 0 (all levels use attention).
             num_blocks: The number of Backbone Block at each level.
-            dropout: The dropout rate used in the RoDitBlock.
-            num_heads: The number of attention heads in the RoDitBlock.
-            num_groups: The number of groups for GroupNorm in the RoDitBlock.
+            dropout: The dropout rate used in the AttentionResnetBlock.
+            num_heads: The number of attention heads in the AttentionResnetBlock.
+            num_groups: The number of groups for GroupNorm in the AttentionResnetBlock.
             num_conditions: The number of conditions.
-            emb_dim: The dimension of the time and conditional embeddings passed to the RoDitBlock.
+            emb_dim: The dimension of the time and conditional embeddings passed to the AttentionResnetBlock.
                 Defaults to `model_channels`.
             padding_mode: The padding mode for all convolutions.
-            alpha: The NTK interpolation scaling factor for RoPE. Defaults to 1.0 (no scaling).
         """
         super().__init__()
         if len(downsample_out_ch_mult) < 2:
@@ -1227,7 +1226,6 @@ class RoDitUnet(nn.Module):
         self.num_heads = num_heads
         self.num_groups = num_groups
         self.padding_mode = padding_mode
-        self.alpha = alpha
 
         # --- Embedding Setup ---
         emb_dim = emb_dim or model_channels
@@ -1254,7 +1252,6 @@ class RoDitUnet(nn.Module):
         rodit_block_args = {
             **resnet_block_args,
             "num_heads": num_heads,
-            "alpha": alpha,
         }
 
         self.conv_in = nn.Conv2d(in_channels, model_channels, 3, padding=1, padding_mode=padding_mode)
@@ -1276,12 +1273,12 @@ class RoDitUnet(nn.Module):
             # Channels for the NEXT level, which will be the output of THIS level's downsampler.
             next_level_channels = ch_schedule[i + 1]
 
-            # Determine whether to use ResnetBlock or RoDitBlock
+            # Determine whether to use ResnetBlock or AttentionResnetBlock
             if i < self.start_attn_level:
                 Block = ResnetBlock
                 block_args = resnet_block_args
             else:
-                Block = RoDitBlock
+                Block = AttentionResnetBlock
                 block_args = rodit_block_args
 
             # Build the blocks for the current level. They operate on `current_level_channels`.
@@ -1314,8 +1311,8 @@ class RoDitUnet(nn.Module):
             num_groups=num_groups,
         )
         self.middle_blocks = nn.ModuleList([
-            RoDitBlock(channels=bottleneck_ch, **rodit_block_args),
-            RoDitBlock(channels=bottleneck_ch, **rodit_block_args)
+            AttentionResnetBlock(channels=bottleneck_ch, **rodit_block_args),
+            AttentionResnetBlock(channels=bottleneck_ch, **rodit_block_args)
         ])
         ch = bottleneck_ch
 
@@ -1352,7 +1349,7 @@ class RoDitUnet(nn.Module):
                 Block = ResnetBlock
                 block_args = resnet_block_args
             else:
-                Block = RoDitBlock
+                Block = AttentionResnetBlock
                 block_args = rodit_block_args
 
             self.up_blocks.append(
@@ -1486,7 +1483,7 @@ class TestCoreModules(unittest.TestCase):
 
     def test_sinusoidal_pos_emb(self):
         """Test SinusoidalPosEmb module."""
-        emb = SinusoidalPosEmb(self.emb_dim - 1)  # Test odd dimension correction
+        emb = SinusoidalPosEmb(self.emb_dim - 1).to(self.device)  # Test odd dimension correction
         self.assertEqual(emb.embedding_dim, self.emb_dim)
         x = torch.randint(0, 100, (self.batch_size,)).to(self.device)
         output = emb(x)
@@ -1506,21 +1503,6 @@ class TestCoreModules(unittest.TestCase):
         with self.assertRaises(ValueError):
             RoPE(dim=31)  # Odd dimension
 
-    def test_rotary_embedding_2d(self):
-        """Test RotaryEmbedding2D module."""
-        dim = 32  # Must be divisible by 4
-        num_heads = 4
-        head_dim = dim // num_heads
-        rope = RotaryEmbedding2D(dim=head_dim, alpha=1.5).to(self.device)
-        q = torch.randn(self.batch_size, self.height * self.width, num_heads, head_dim).to(self.device)
-        k = torch.randn(self.batch_size, self.height * self.width, num_heads, head_dim).to(self.device)
-        q_rot, k_rot = rope(q, k, self.height, self.width)
-        self.assertEqual(q_rot.shape, q.shape)
-        self.assertEqual(k_rot.shape, k.shape)
-        self.assertFalse(torch.allclose(q_rot, q))
-        with self.assertRaises(ValueError):
-            RotaryEmbedding2D(dim=10)  # Not divisible by 4
-
     def test_msa_with_rope(self):
         """Test MSAWithRoPE module."""
         num_heads = 4
@@ -1533,7 +1515,7 @@ class TestCoreModules(unittest.TestCase):
         with self.assertRaises(AssertionError):
             MSAWithRoPE(channels=30, num_heads=4)  # Channels not divisible by heads
         with self.assertRaises(AssertionError):
-            MSAWithRoPE(channels=32, num_heads=5)  # Head dim not div by 4
+            MSAWithRoPE(channels=32, num_heads=5)  # Head dim not div by 2
 
     def test_mlp(self):
         """Test Mlp module."""
@@ -1544,7 +1526,7 @@ class TestCoreModules(unittest.TestCase):
 
 
 class TestBuildingBlocks(unittest.TestCase):
-    """Tests for composite blocks like RoDitBlock, Upsample, and Downsample."""
+    """Tests for composite blocks like AttentionResnetBlock, Upsample, and Downsample."""
 
     def setUp(self):
         self.batch_size = 2
@@ -1554,16 +1536,16 @@ class TestBuildingBlocks(unittest.TestCase):
         self.emb_dim = 64
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def test_rodit_block(self):
-        """Test RoDitBlock module."""
-        block = RoDitBlock(channels=self.channels, emb_dim=self.emb_dim, num_heads=4).to(self.device)
+    def test_attention_resnet_block(self):
+        """Test AttentionResnetBlock module."""
+        block = AttentionResnetBlock(channels=self.channels, emb_dim=self.emb_dim, num_heads=4).to(self.device)
         x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
         emb = torch.randn(self.batch_size, self.emb_dim).to(self.device)
         output = block(x, emb)
         self.assertEqual(output.shape, x.shape)
 
         # Test identity case
-        block_identity = RoDitBlock(0, 0)
+        block_identity = AttentionResnetBlock(0, 0)
         output_identity = block_identity(x, emb)
         self.assertTrue(torch.allclose(x, output_identity))
 
@@ -1661,17 +1643,17 @@ class TestRoDitUnet(unittest.TestCase):
             {
                 "desc": "All levels use attention",
                 "start_attn_level": 0,
-                "expected_block": RoDitBlock,  # Applies to all levels
+                "expected_block": AttentionResnetBlock,  # Applies to all levels
             },
             {
                 "desc": "Attention starts at level 1",
                 "start_attn_level": 1,
-                "expected_block": [ResnetBlock, RoDitBlock, RoDitBlock],  # For levels 0, 1, 2
+                "expected_block": [ResnetBlock, AttentionResnetBlock, AttentionResnetBlock],  # For levels 0, 1, 2
             },
             {
                 "desc": "Attention starts at the last level (level 2)",
                 "start_attn_level": num_levels - 1,  # This is 2
-                "expected_block": [ResnetBlock, ResnetBlock, RoDitBlock],  # For levels 0, 1, 2
+                "expected_block": [ResnetBlock, ResnetBlock, AttentionResnetBlock],  # For levels 0, 1, 2
             },
             {
                 "desc": "Only bottleneck uses attention (all encoder/decoder levels are Resnet)",
@@ -1692,10 +1674,10 @@ class TestRoDitUnet(unittest.TestCase):
                         self.assertIsInstance(block, BlockType,
                                               f"Down Block at level {level_idx} should be {BlockType.__name__}")
 
-                # 2. Verify Bottleneck (middle_blocks) - should always be RoDitBlock
+                # 2. Verify Bottleneck (middle_blocks) - should always be AttentionResnetBlock
                 for block in model.middle_blocks:
-                    self.assertIsInstance(block, RoDitBlock,
-                                          "Bottleneck block should always be RoDitBlock")
+                    self.assertIsInstance(block, AttentionResnetBlock,
+                                          "Bottleneck block should always be AttentionResnetBlock")
 
                 # 3. Verify Decoder (up_blocks)
                 # up_blocks are ordered from deep to shallow (corresponding to levels 2, 1, 0)
