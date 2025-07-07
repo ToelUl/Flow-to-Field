@@ -1073,8 +1073,7 @@ class PottsModel(MonteCarloSampler):
             Tensor: Heat capacity tensor with shape [batch_size].
         """
         T = self.T.to(self.device)
-        energy = self.compute_energy()  # Shape: [batch_size, n_chains]
-        c = torch.var(energy, dim=1) / (T**2)
+        c = torch.var(self.compute_energy(), dim=1) / (T**2)
         return c / self.L**2
 
     def compute_magnetization(self) -> Tensor:
