@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 from abc import ABC, abstractmethod
 try:
     from scipy.signal import savgol_coeffs
@@ -589,6 +589,39 @@ class MonteCarloSampler(nn.Module, ABC):
             # Clean up temporary clones
             del original_spins_start, original_spins_partner, expanded_swap_mask
 
+    @staticmethod
+    def iqr_filter(
+            x: Tensor,
+            dim: int,
+            k: float = 1.5,
+            eps: float = 1e-12,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        """Remove extreme values along a given dimension via the IQR rule.
+
+        Args:
+            x (Tensor): Input tensor of arbitrary shape.
+            dim (int): Dimension along which to compute quartiles.
+            k   (float, optional): IQR multiplier. Defaults to 1.5 (Tukey rule).
+            eps (float, optional): Numerical stability for zero IQR. Defaults 1e-12.
+
+        Returns:
+            Tensor: Processed tensor.
+
+        Example::
+            >>> x = torch.randn(4, 1000, device="cuda")
+            >>> x_clean = iqr_filter(x, dim=1)
+        """
+        # Compute quartiles (keepdim for broadcasting)
+        q1 = torch.quantile(x, 0.25, dim=dim, keepdim=True)
+        q3 = torch.quantile(x, 0.75, dim=dim, keepdim=True)
+        iqr = q3 - q1
+        # Avoid division by zero for degenerate distributions
+        iqr = iqr + eps
+
+        lower = q1 - k * iqr
+        upper = q3 + k * iqr
+
+        return torch.maximum(torch.minimum(x, upper), lower)
 
     @staticmethod
     def high_precision_derivative(
