@@ -2,14 +2,6 @@
 """
 Flexible Diffusion Transformer Model supporting variable input resolutions.
 
-This module implements a Diffusion Transformer (DiT) model inspired by
-Stable Diffusion 3 and FiT principles. It accepts a noisy latent image of
-variable height and width, a timestep, and one or more scalar conditions
-as input. It uses 2D Rotary Position Embedding (RoPE) instead of
-absolute positional embeddings to handle variable input sizes and incorporates
-Masked Multi-Head Self-Attention. Scalar conditions are embedded using
-sinusoidal positional embeddings and combined with the timestep embedding
-for modulation within the transformer blocks.
 """
 
 import torch
@@ -17,6 +9,8 @@ import torch.nn as nn
 import math
 import unittest
 from typing import Sequence, Union, Optional, Tuple
+
+torch.set_float32_matmul_precision('high')
 
 # ========= Helper Functions & Modules =========
 
@@ -618,7 +612,7 @@ class ScalarConditionEmbedder(nn.Module):
 
 # ========= Main Model: Flexible Diffusion Transformer =========
 @torch.compile
-class Flexible_Diffusion_Transformer(nn.Module):
+class FlexibleDiT(nn.Module):
     """
     A Flexible Diffusion Transformer (DiT) supporting variable input resolutions.
 
@@ -806,7 +800,7 @@ class Flexible_Diffusion_Transformer(nn.Module):
 # ========= Updated Test Suite =========
 
 class TestFlexibleDiffusionTransformer(unittest.TestCase):
-    """Unit test suite for the Flexible_Diffusion_Transformer and components."""
+    """Unit test suite for the FlexibleDiT and components."""
 
     def setUp(self):
         """Set up common parameters and models for testing."""
@@ -856,7 +850,7 @@ class TestFlexibleDiffusionTransformer(unittest.TestCase):
         """Test if the main flexible model initializes correctly."""
         print("Test 01: Flexible Model Initialization")
         try:
-            model = Flexible_Diffusion_Transformer(
+            model = FlexibleDiT(
                 patch_size=self.patch_size,
                 in_channels=self.in_channels,
                 hidden_dim=self.hidden_dim,
@@ -964,7 +958,7 @@ class TestFlexibleDiffusionTransformer(unittest.TestCase):
         """Test the flexible unpatchify method."""
         print("Test 05: unpatchify method (flexible)")
         if self.test_rope is None: self.skipTest("Skipping test: RoPE setup failed.")
-        model = Flexible_Diffusion_Transformer(
+        model = FlexibleDiT(
             patch_size=self.patch_size, in_channels=self.in_channels,
             hidden_dim=self.hidden_dim, depth=self.depth, num_heads=self.num_heads,
             learn_sigma=True
@@ -990,7 +984,7 @@ class TestFlexibleDiffusionTransformer(unittest.TestCase):
         """Test forward pass with flexible resolutions (learn_sigma=True)."""
         print("Test 06: Forward Pass Shape (Flexible Res, learn_sigma=True)")
         if self.test_rope is None: self.skipTest("Skipping test: RoPE setup failed.")
-        model = Flexible_Diffusion_Transformer(
+        model = FlexibleDiT(
             patch_size=self.patch_size, in_channels=self.in_channels, hidden_dim=self.hidden_dim,
             depth=self.depth, num_heads=self.num_heads, learn_sigma=True,
             max_rope_res_h=self.max_rope_res, max_rope_res_w=self.max_rope_res,
@@ -1014,7 +1008,7 @@ class TestFlexibleDiffusionTransformer(unittest.TestCase):
         """Test forward pass with flexible resolutions (learn_sigma=False)."""
         print("Test 07: Forward Pass Shape (Flexible Res, learn_sigma=False)")
         if self.test_rope is None: self.skipTest("Skipping test: RoPE setup failed.")
-        model = Flexible_Diffusion_Transformer(
+        model = FlexibleDiT(
             patch_size=self.patch_size, in_channels=self.in_channels, hidden_dim=self.hidden_dim,
             depth=self.depth, num_heads=self.num_heads, learn_sigma=False,
             max_rope_res_h=self.max_rope_res, max_rope_res_w=self.max_rope_res,
@@ -1038,7 +1032,7 @@ class TestFlexibleDiffusionTransformer(unittest.TestCase):
         """Test forward pass with flexible resolutions and multiple conditions."""
         print("Test 08: Forward Pass Shape (Flexible Res, Multiple Conditions)")
         if self.test_rope is None: self.skipTest("Skipping test: RoPE setup failed.")
-        model = Flexible_Diffusion_Transformer(
+        model = FlexibleDiT(
             patch_size=self.patch_size, in_channels=self.in_channels, hidden_dim=self.hidden_dim,
             depth=self.depth, num_heads=self.num_heads, learn_sigma=True,
             max_rope_res_h=self.max_rope_res, max_rope_res_w=self.max_rope_res,
@@ -1061,7 +1055,7 @@ class TestFlexibleDiffusionTransformer(unittest.TestCase):
         """Test forward pass with an attention mask."""
         print("Test 09: Forward Pass with Attention Mask")
         if self.test_rope is None: self.skipTest("Skipping test: RoPE setup failed.")
-        model = Flexible_Diffusion_Transformer(
+        model = FlexibleDiT(
             patch_size=self.patch_size, in_channels=self.in_channels, hidden_dim=self.hidden_dim,
             depth=self.depth, num_heads=self.num_heads, learn_sigma=False,
             max_rope_res_h=self.max_rope_res, max_rope_res_w=self.max_rope_res,
@@ -1147,9 +1141,9 @@ class TestFlexibleDiffusionTransformer(unittest.TestCase):
         """Test initialization with invalid parameters."""
         print("Test 13: Initialization Edge Cases")
         if self.test_rope is None: self.skipTest("Skipping test: RoPE setup failed.")
-        with self.assertRaises(ValueError): Flexible_Diffusion_Transformer(hidden_dim=0)
-        with self.assertRaises(ValueError): Flexible_Diffusion_Transformer(depth=0)
-        with self.assertRaises(ValueError): Flexible_Diffusion_Transformer(hidden_dim=130, num_heads=4)
+        with self.assertRaises(ValueError): FlexibleDiT(hidden_dim=0)
+        with self.assertRaises(ValueError): FlexibleDiT(depth=0)
+        with self.assertRaises(ValueError): FlexibleDiT(hidden_dim=130, num_heads=4)
         with self.assertRaises(ValueError): RotaryEmbedding(dim=30) # RoPE dim not div by 4
         bad_rope = RotaryEmbedding(dim=self.head_dim + 4)
         with self.assertRaises(ValueError): FlexibleAttention(dim=self.hidden_dim, num_heads=self.num_heads, rope=bad_rope)
@@ -1159,7 +1153,7 @@ class TestFlexibleDiffusionTransformer(unittest.TestCase):
         """Test forward pass with invalid input shapes/types."""
         print("Test 14: Forward Pass Input Errors")
         if self.test_rope is None: self.skipTest("Skipping test: RoPE setup failed.")
-        model = Flexible_Diffusion_Transformer(
+        model = FlexibleDiT(
             patch_size=self.patch_size, in_channels=self.in_channels, hidden_dim=self.hidden_dim,
             depth=self.depth, num_heads=self.num_heads,
             max_rope_res_h=self.max_rope_res, max_rope_res_w=self.max_rope_res,
@@ -1204,7 +1198,7 @@ class TestFlexibleDiffusionTransformer(unittest.TestCase):
 
 if __name__ == '__main__':
     print("="*70)
-    print(" Starting Unit Tests for Flexible_Diffusion_Transformer ".center(70, "="))
+    print(" Starting Unit Tests for FlexibleDiT ".center(70, "="))
     print("="*70)
 
     loader = unittest.TestLoader()
@@ -1236,7 +1230,7 @@ if __name__ == '__main__':
             num_classes_ex = 10
             num_styles_ex = 5
 
-            model_ex = Flexible_Diffusion_Transformer(
+            model_ex = FlexibleDiT(
                 patch_size=patch_size_ex, in_channels=in_channels_ex, hidden_dim=hidden_dim_ex,
                 depth=depth_ex, num_heads=num_heads_ex, learn_sigma=learn_sigma_ex,
                 max_rope_res_h=max_rope_res_ex, max_rope_res_w=max_rope_res_ex

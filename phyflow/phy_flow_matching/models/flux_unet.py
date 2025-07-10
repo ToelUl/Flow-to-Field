@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Sequence
 from dataclasses import dataclass
+import unittest
 
 torch.set_float32_matmul_precision('high')
 
@@ -743,58 +744,175 @@ class FluxUNet(nn.Module):
 # Section 6: Testing Code
 # ==============================================================================
 
-if __name__ == '__main__':
-    # --- Configuration ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 2
-    image_size = 64
-    in_channels = 4
-    model_channels = 128
-    channel_mults = (1, 2, 4)
-    num_blocks = 1  # Simplified for quick debugging
-    num_heads = 8
-    start_attn_level = 1
-    num_conditions = 2
-    out_channels = in_channels
+class TestFluxUNetComponents(unittest.TestCase):
+    """Test individual components of the FluxUNet architecture."""
 
-    print("🚀 Creating Final Flux-Style U-Net Model...")
+    def setUp(self):
+        """Set up common parameters and tensors for tests."""
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = 2
+        self.channels = 16
+        self.height = 32
+        self.width = 32
+        self.emb_dim = 64
+        self.seq_len = 10
+        self.head_dim = 8
+        self.num_heads = self.channels // self.head_dim
 
-    # Instantiate the model
-    compiled_model = FluxUNet(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        model_channels=model_channels,
-        channel_mults=channel_mults,
-        num_blocks=num_blocks,
-        num_heads=num_heads,
-        start_attn_level=start_attn_level,
-        num_conditions=num_conditions
-    ).to(device)
+        self.x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
+        self.vec = torch.randn(self.batch_size, self.emb_dim).to(self.device)
+        self.cond_seq = torch.randn(self.batch_size, self.seq_len, self.emb_dim).to(self.device)
 
-    num_params = sum(p.numel() for p in compiled_model.parameters())
-    print("✅ Model created successfully!")
-    print(f"   - Total Parameters: {num_params / 1e6:.2f} M")
-    print(f"   - Running on device: {device.type.upper()}")
+    def test_rotate_half(self):
+        """Test the rotate_half helper for RoPE."""
+        x = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.float32)
+        expected = torch.tensor([[-2., 1., -4., 3.], [-6., 5., -8., 7.]], dtype=torch.float32)
+        output = rotate_half(x)
+        self.assertEqual(output.shape, x.shape)
+        self.assertTrue(torch.allclose(output, expected))
 
-    print("\n📦 Preparing dummy input data...")
-    x = torch.randn(batch_size, in_channels, image_size, image_size, device=device)
-    time = torch.randint(0, 1000, (batch_size,), device=device)
-    cond1 = torch.randint(0, 10, (batch_size,), device=device)
-    cond2 = torch.randn(batch_size, device=device)
-    conditions = [cond1, cond2]
-    print(f"   - Image input shape:   {x.shape}")
-    print(f"   - Timestep input shape: {time.shape}")
-    print(f"   - Condition shapes:    {[c.shape for c in conditions]}")
+    def test_modulate(self):
+        """Test the Ada-LayerNorm modulation function."""
+        shift = torch.randn(self.batch_size, self.channels).to(self.device)
+        scale = torch.randn(self.batch_size, self.channels).to(self.device)
+        output = modulate(self.x, shift, scale)
+        self.assertEqual(output.shape, self.x.shape)
 
-    print("\n⚡️ Executing forward pass test...")
-    try:
+    def test_rmsnorm2d(self):
+        """Test the RMSNorm2d layer."""
+        norm = RMSNorm2d(self.channels).to(self.device)
+        output = norm(self.x)
+        self.assertEqual(output.shape, self.x.shape)
+
+    def test_qknorm(self):
+        """Test the QKNorm layer."""
+        q = torch.randn(self.batch_size, self.seq_len, self.head_dim).to(self.device)
+        k = torch.randn(self.batch_size, self.seq_len, self.head_dim).to(self.device)
+        norm = QKNorm(self.head_dim).to(self.device)
+        q_norm, k_norm = norm(q, k)
+        self.assertEqual(q_norm.shape, q.shape)
+        self.assertEqual(k_norm.shape, k.shape)
+
+    def test_modulation_module(self):
+        """Test the Modulation module for generating shift/scale/gate."""
+        mod_single = Modulation(self.emb_dim, self.channels, is_double=False).to(self.device)
+        mod1, mod2 = mod_single(self.vec)
+        self.assertIsInstance(mod1, ModulationOut)
+        self.assertIsNone(mod2)
+        self.assertEqual(mod1.shift.shape, (self.batch_size, self.channels))
+
+        mod_double = Modulation(self.emb_dim, self.channels, is_double=True).to(self.device)
+        mod1_d, mod2_d = mod_double(self.vec)
+        self.assertIsInstance(mod1_d, ModulationOut)
+        self.assertIsInstance(mod2_d, ModulationOut)
+        self.assertEqual(mod2_d.shift.shape, (self.batch_size, self.channels))
+
+    def test_mlp(self):
+        """Test the spatial MLP block."""
+        mlp = Mlp(self.channels).to(self.device)
+        output = mlp(self.x)
+        self.assertEqual(output.shape, self.x.shape)
+
+    def test_sinusoidal_pos_emb(self):
+        """Test the SinusoidalPosEmb module."""
+        emb = SinusoidalPosEmb(self.emb_dim).to(self.device)
+        t = torch.randint(0, 100, (self.batch_size,)).to(self.device)
+        output = emb(t)
+        self.assertEqual(output.shape, (self.batch_size, self.emb_dim))
+
+    def test_rope_and_rope_mixed(self):
+        """Test both 1D and 2D RoPE modules."""
+        rope1d = RoPE(dim=self.head_dim).to(self.device)
+        seq = torch.randn(self.batch_size, self.seq_len, self.head_dim).to(self.device)
+        output1d = rope1d(seq)
+        self.assertEqual(output1d.shape, seq.shape)
+
+        rope2d = RoPE_Mixed(dim=self.head_dim).to(self.device)
+        spatial_seq = torch.randn(self.batch_size, self.height, self.width, self.head_dim).to(self.device)
+        output2d = rope2d(spatial_seq)
+        self.assertEqual(output2d.shape, spatial_seq.shape)
+
+    def test_fluxlike_resnet_block(self):
+        """Test the FluxlikeResnetBlock in both attention and non-attention modes."""
+        block_args = {
+            "channels": self.channels, "emb_dim": self.emb_dim, "num_heads": self.num_heads,
+            "dropout": 0.1, "padding_mode": "replicate"
+        }
+        block_no_attn = FluxlikeResnetBlock(use_attention=False, **block_args).to(self.device)
+        output_no_attn = block_no_attn(self.x, self.cond_seq, self.vec)
+        self.assertEqual(output_no_attn.shape, self.x.shape)
+
+        block_attn = FluxlikeResnetBlock(use_attention=True, **block_args).to(self.device)
+        output_attn = block_attn(self.x, self.cond_seq, self.vec)
+        self.assertEqual(output_attn.shape, self.x.shape)
+
+    def test_downsample_upsample(self):
+        """Test the Downsample and Upsample layers."""
+        out_channels = self.channels * 2
+        downsampler = Downsample(self.channels, out_channels, "replicate").to(self.device)
+        h_down = downsampler(self.x)
+        self.assertEqual(h_down.shape, (self.batch_size, out_channels, self.height // 2, self.width // 2))
+
+        upsampler = Upsample(out_channels, self.channels, "replicate").to(self.device)
+        h_up = upsampler(h_down)
+        self.assertEqual(h_up.shape, self.x.shape)
+
+
+class TestFluxUNetEndToEnd(unittest.TestCase):
+    """Perform end-to-end tests on the complete FluxUNet model."""
+
+    def setUp(self):
+        """Set up the model and input data for end-to-end tests."""
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = 2
+        self.image_size = 32
+        self.in_channels = 4
+        self.model_channels = 32
+        self.num_conditions = 2
+
+        self.model_config = {
+            "in_channels": self.in_channels, "out_channels": self.in_channels,
+            "model_channels": self.model_channels, "channel_mults": (1, 2),
+            "num_blocks": 1, "num_heads": 4, "start_attn_level": 0,
+            "num_conditions": self.num_conditions
+        }
+        self.x = torch.randn(self.batch_size, self.in_channels, self.image_size, self.image_size, device=self.device)
+        self.time = torch.randint(0, 1000, (self.batch_size,), device=self.device)
+        self.conditions = [
+            torch.randint(0, 10, (self.batch_size,), device=self.device),
+            torch.randn(self.batch_size, device=self.device)
+        ]
+
+    def test_forward_pass_shape(self):
+        """Test the forward pass with conditions and validate output shape."""
+        model = FluxUNet(**self.model_config).to(self.device)
+        model.eval()
         with torch.no_grad():
-            output = compiled_model(x, time, conditions)
-        print("✅ Forward pass successful!")
-        print(f"   - Output shape: {output.shape}")
-        assert output.shape == x.shape, "Output shape does not match input shape!"
-        print("   - Output shape validation successful!")
-    except Exception as e:
-        print(f"❌ Forward pass failed: {e}")
-        import traceback
-        traceback.print_exc()
+            output = model(self.x, self.time, self.conditions)
+        self.assertEqual(output.shape, self.x.shape)
+
+    def test_forward_pass_no_conditions(self):
+        """Test forward pass when num_conditions is 0."""
+        config = self.model_config.copy()
+        config["num_conditions"] = 0
+        model = FluxUNet(**config).to(self.device)
+        model.eval()
+        with torch.no_grad():
+            output = model(self.x, self.time, None)
+        self.assertEqual(output.shape, self.x.shape)
+
+    def test_torch_compile(self):
+        """Test if the model can be compiled with torch.compile."""
+        model = FluxUNet(**self.model_config).to(self.device)
+
+        try:
+            with torch.no_grad():
+                output = model(self.x, self.time, self.conditions)
+            self.assertEqual(output.shape, self.x.shape)
+        except Exception as e:
+            self.fail(f"torch.compile failed with an exception: {e}")
+
+
+if __name__ == '__main__':
+    print("🚀 Running Formal Unittest Suite for FluxUNet...")
+    unittest.main(argv=['first-arg-is-ignored'], exit=False)
