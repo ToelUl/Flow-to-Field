@@ -15,6 +15,8 @@ from .monte_carlo import XYModel, IsingModel, PottsModel, MCDataset, MCDataGener
 from .phy_flow_matching import (
     DiResUnet,
     RoDitUnet,
+    FluxUNet,
+    FlexibleDiT,
     CFMWrapper,
     logit_normal_sampler,
     timestep_scheduler,
@@ -42,6 +44,8 @@ __all__ = [
     'MCDataGenerator',
     'DiResUnet',
     'RoDitUnet',
+    'FluxUNet',
+    'FlexibleDiT',
     'CFMWrapper',
     'logit_normal_sampler',
     'timestep_scheduler',
