@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
-from typing import Tuple, Optional, Union
+from typing import Tuple, Optional, Union, Callable
 from abc import ABC, abstractmethod
 try:
     from scipy.signal import savgol_coeffs
@@ -622,6 +622,99 @@ class MonteCarloSampler(nn.Module, ABC):
         upper = q3 + k * iqr
 
         return torch.maximum(torch.minimum(x, upper), lower)
+
+    @staticmethod
+    def replace_outlier_channels_by_median(
+            x: Tensor,
+            stat_func: Callable = lambda t: torch.mean(t, dim=(-2, -1)),
+            k: float = 1.5,
+            eps: float = 1e-12,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Identifies and replaces outlier channels with the median channel based on
+        channel-wise statistics.
+
+        This function first calculates a statistic for each channel (e.g., mean) to
+        produce a (B, C) tensor. It then applies the IQR rule along the channel
+        dimension to identify which channels are outliers. Simultaneously, it finds
+        the channel whose statistic is closest to the median of all channel statistics
+        (the "median channel"). Finally, it replaces the data of the outlier channels
+        in the original tensor with the data from the median channel.
+
+        Args:
+            x (Tensor): The input tensor of shape (B, C, H, W).
+            stat_func (Callable, optional):
+                A function to calculate the statistic for each channel.
+                It should accept a (B, C, H, W) tensor and return a (B, C) tensor.
+                Defaults to calculating the mean over spatial dimensions.
+            k (float, optional): The IQR multiplier for defining outlier bounds.
+                                 Defaults to 1.5 (Tukey's fences).
+            eps (float, optional): A small epsilon added to the IQR for numerical
+                                   stability to avoid division by zero. Defaults to 1e-12.
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor]:
+            - processed_x (Tensor): The new tensor of shape (B, C, H, W) after
+                                    processing.
+            - outlier_mask (Tensor): A boolean tensor of shape (B, C) marking the
+                                     outlier channels (True).
+            - median_channel_idx (Tensor): A tensor of length B containing the index
+                                           of the median channel for each batch item.
+        """
+        if x.ndim != 4:
+            raise ValueError(f"Input tensor must be 4D (B, C, H, W), but got {x.ndim}D")
+
+        B, C, H, W = x.shape
+        # If there are too few channels, IQR analysis is not meaningful
+        if C <= 3:
+            # Return the original tensor and empty markers
+            return x, torch.zeros((B, C), dtype=torch.bool, device=x.device), torch.full((B,), C // 2, dtype=torch.long,
+                                                                                         device=x.device)
+
+        # 1. Calculate statistics -> obtain a (B, C) tensor
+        stats = stat_func(x)
+        if stats.shape != (B, C):
+            raise ValueError(f"stat_func should produce a tensor of shape (B, C), but got {stats.shape}")
+
+        # 2. Identify outlier and median channels (operating on dim=1, the channel dimension)
+        # Calculate IQR-related values (keepdim=True for broadcasting)
+        q1 = torch.quantile(stats, 0.25, dim=1, keepdim=True)
+        q3 = torch.quantile(stats, 0.75, dim=1, keepdim=True)
+        median_val = torch.quantile(stats, 0.5, dim=1, keepdim=True)  # Median of the statistics
+        iqr = q3 - q1 + eps
+
+        # Define outlier boundaries
+        lower_bound = q1 - k * iqr
+        upper_bound = q3 + k * iqr
+
+        # Create a boolean mask for outlier channels
+        outlier_mask = (stats < lower_bound) | (stats > upper_bound)  # Shape: (B, C)
+
+        # Find the index of the median channel
+        # Calculate the absolute difference of each channel's stat from the median stat
+        abs_diff_from_median = torch.abs(stats - median_val)
+        # The channel with the minimum difference is the median channel
+        median_channel_idx = torch.argmin(abs_diff_from_median, dim=1)  # Shape: (B,)
+
+        # 3. Perform Channel Replacement
+        # Create a copy to avoid in-place modification of the original tensor
+        processed_x = x.clone()
+
+        # Iterate over each item in the batch
+        for i in range(B):
+            # Get the data of the median channel for the current batch item
+            # median_channel_idx[i] is a scalar index
+            median_data = x[i, median_channel_idx[i], :, :]  # Shape: (H, W)
+
+            # Get the indices of the outlier channels for the current batch item
+            # outlier_mask[i] is a boolean tensor of shape (C,)
+            current_outlier_indices = torch.where(outlier_mask[i])[0]
+
+            if current_outlier_indices.numel() > 0:
+                # Replace all outlier channels with the median channel's data
+                processed_x[i, current_outlier_indices, :, :] = median_data
+
+        return processed_x, outlier_mask, median_channel_idx
 
     @staticmethod
     def high_precision_derivative(

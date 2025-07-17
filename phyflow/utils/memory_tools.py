@@ -9,6 +9,7 @@ def _measure_activation_bytes(
         channels: int,
         height: int,
         width: int,
+        num_conditions: int,
         dtype: torch.dtype,
         device: torch.device
 ) -> int:
@@ -28,6 +29,7 @@ def _measure_activation_bytes(
         channels: Number of input channels C.
         height: Input height H.
         width: Input width W.
+        num_conditions: Number of conditions in the context list.
         dtype: The data type of the input tensor.
         device: The device to run the dummy forward pass on.
 
@@ -61,7 +63,7 @@ def _measure_activation_bytes(
         dummy_x = torch.zeros((1, channels, height, width), dtype=dtype, device=device)
         dummy_time = torch.zeros((1,), dtype=dtype, device=device)
         dummy_condition = torch.zeros((1,), dtype=dtype, device=device)
-        _ = model(dummy_x, dummy_time, [dummy_condition, dummy_condition])
+        _ = model(dummy_x, dummy_time, [dummy_condition for _ in range(num_conditions)])
 
     # Clean up by removing the hooks
     for h in hooks:
@@ -77,6 +79,7 @@ def estimate_max_batch_size(
         height: int,
         width: int,
         time_steps: int,
+        num_conditions: int = 1,
         dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
         num_evals: Optional[int] = None,
@@ -103,6 +106,7 @@ def estimate_max_batch_size(
         height: Input height H.
         width: Input width W.
         time_steps: Number of time points T to be stored in the output.
+        num_conditions: Number of conditions in the context list (default: 1).
         dtype: Tensor data type (default: torch.float32).
         device: Device to run the model on (default: None, auto-detected).
         num_evals: Number of function evaluations (NFE) for the ODE solver.
@@ -147,7 +151,7 @@ def estimate_max_batch_size(
     # 3. Calculate per-sample memory cost
     # (a) Measure activation memory for a single model forward pass
     activation_bytes_per_sample = _measure_activation_bytes(
-        model, channels, height, width, dtype, device
+        model, channels, height, width, num_conditions, dtype, device
     )
 
     state_elems = channels * height * width

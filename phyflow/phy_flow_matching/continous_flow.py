@@ -11,7 +11,7 @@ import random
 import time
 import logging
 from pathlib import Path
-from typing import Tuple, List, Optional, Iterator, Any, Type, Union
+from typing import Tuple, List, Optional, Iterator, Any, Type, Union, Callable
 
 import numpy as np
 from tqdm import tqdm
@@ -486,6 +486,8 @@ class CFMExecutor:
         label: Tensor,
         prob_path: AffineProbPath,
         gradient_accumulation_steps: int = 1,
+        kinetic_regularization: float = None,
+        mu_logit: float = 0.0,
         sigma_logit: float = 1.0
     ) -> float:
         """Performs a single training step (forward pass and loss calculation).
@@ -500,30 +502,52 @@ class CFMExecutor:
             prob_path: The probability path generator.
             gradient_accumulation_steps: The number of steps over which
                 gradients are accumulated. The loss is scaled by this factor.
-            sigma_logit: Standard deviation for the logit-normal sampler,
+            kinetic_regularization: Optional regularization term for kinetic energy.
+            mu_logit: Mean for the logit-normal sampler.
+            sigma_logit: Standard deviation for the logit-normal sampler.
 
         Returns:
             The unscaled loss value for this step.
         """
-        x1, temp = data.to(self.device), label.to(self.device)
+        if isinstance(label, Tensor):
+            x1, conds = data.to(self.device), label.to(self.device)
+            multi_label = False
+        elif isinstance(label, list):
+            x1, conds = data.to(self.device), [c.to(self.device) for c in label]
+            multi_label = True
+        else:
+            raise TypeError(
+                "Label must be a Tensor or a list of Tensors. "
+                f"Received type: {type(label)}"
+            )
 
         # Sample $x_0$ from a standard Normal distribution (common choice for base).
         x_0 = torch.randn_like(x1, device=self.device)
 
         # Sample time $t$ using a logit-normal sampler, typically biasing
         # samples towards the ends of the [0,1] interval.
-        t = logit_normal_sampler(shape=(x1.shape[0],), sigma_logit=sigma_logit, device=self.device)
+        t = logit_normal_sampler(
+            shape=(x1.shape[0],),
+            mu_logit=mu_logit,
+            sigma_logit=sigma_logit,
+            device=self.device
+        )
 
         # Sample $x_t$ and $dx_t/dt$ (target velocity) from the probability path.
         path_sample = prob_path.sample(t=t, x_0=x_0, x_1=x1)
 
         # Get model's predicted velocity $v(x_t, t, condition)$.
         model_output = self.model(
-            x=path_sample.x_t, time=path_sample.t, conditions=[1 + torch.exp(-0.5 * temp), 10 * torch.rand_like(temp)]
+            x=path_sample.x_t, time=path_sample.t,
+            conditions=[conds,] if not multi_label else conds
         )
 
         # Compute loss (e.g., MSE between predicted and target velocity).
         loss = self.loss_fn(model_output, path_sample.dx_t)
+
+        if kinetic_regularization is not None:
+            kinetic_loss = torch.pow(model_output, 2).mean() * kinetic_regularization
+            loss += kinetic_loss
 
         # Scale loss for gradient accumulation.
         scaled_loss = loss / gradient_accumulation_steps
@@ -537,8 +561,11 @@ class CFMExecutor:
         num_epochs: int,
         gradient_accumulation_steps: int = DEFAULT_GRAD_ACCUM_STEPS,
         save_every_epochs: int = DEFAULT_SAVE_EVERY_EPOCHS,
+        kinetic_regularization: float = None,
+        mu_logit: float = 0.0,
         sigma_logit: float = 1.0,
         sigma_logit_increase_per_epoch: float = 0.0,
+        data_argumentation_fn: Callable[[Tensor], Tensor] = None,
         use_amp: bool = False,
     ) -> None:
         """Runs the main training loop.
@@ -555,10 +582,15 @@ class CFMExecutor:
             gradient_accumulation_steps: Number of batches to accumulate
                 gradients over before performing an optimizer step.
             save_every_epochs: Frequency (in epochs) for saving checkpoints.
+            kinetic_regularization: Optional regularization term for kinetic energy.
+            mu_logit: Initial value for the logit-normal sampler's mean.
             sigma_logit: Initial value for the logit-normal sampler's standard deviation.
             sigma_logit_increase_per_epoch: Amount to increase the `sigma_logit`
                 after each epoch. This can help explore the time distribution
                 more effectively as training progresses.
+            data_argumentation_fn: Optional function to apply data argumentation
+                to the input data batch. This function should take a Tensor and
+                return a modified Tensor. If None, no argumentation is applied.
             use_amp: Whether to use Automatic Mixed Precision (AMP) for training.
 
         Raises:
@@ -623,7 +655,8 @@ class CFMExecutor:
             self.epoch_losses = []
 
         logger.info(
-            f"Initial sigma_logit set to {sigma_logit:.4f}. "
+            f"Using logit-normal sampler with mu_logit={mu_logit:.4f},"
+            f" sigma_logit={sigma_logit:.4f}. "
             "This controls the sampling distribution for time t."
         )
 
@@ -672,11 +705,17 @@ class CFMExecutor:
                         # Default label (e.g., for unconditional models or if labels are implicit)
                         label_batch = torch.zeros(data_batch.shape[0], dtype=torch.long)
 
+                    if data_argumentation_fn is not None:
+                        # Apply data argumentation function if provided
+                        data_batch = data_argumentation_fn(data_batch)
+
                     step_loss = self._train_step(
                         data_batch,
                         label_batch,
                         prob_path,
                         gradient_accumulation_steps,
+                        kinetic_regularization=kinetic_regularization,
+                        mu_logit=mu_logit,
                         sigma_logit=sigma_logit
                     )
                     running_epoch_loss += step_loss
@@ -798,6 +837,8 @@ class CFMExecutor:
         atol: float = DEFAULT_ATOL,
         rtol: float = DEFAULT_RTOL,
         time_grid: Tensor = DEFAULT_TIME_GRID_BWD,
+        timestep_schedule_mu: float = -1.1,
+        timestep_schedule_sigma: float = 1.0,
         do_log: bool = True,
         reshape: bool = True,
         **model_extras
@@ -929,7 +970,11 @@ class CFMExecutor:
 
         # Apply timestep scheduling (e.g., variance preserving schedule) to the time grid
         # 'a=3' is a hyperparameter for this specific scheduler
-        time_grid_scheduled_for_ode = timestep_scheduler(time_grid_ode, a=3.0)
+        time_grid_scheduled_for_ode = timestep_scheduler(
+            time_grid_ode,
+            mu=timestep_schedule_mu,
+            sigma=timestep_schedule_sigma,
+        )
         if do_log:
             logger.info(f"  Time Grid (Scheduled for ODE): {time_grid_scheduled_for_ode.tolist()}")
 
@@ -1128,6 +1173,8 @@ class CFMExecutor:
         balance: float = 0.5,
         exact_divergence: bool = False,
         num_steps: int = DEFAULT_TRAIN_WITH_MLE_NUM_STEPS,
+        timestep_schedule_mu: float = -1.1,
+        timestep_schedule_sigma: float = 1.0,
         method: str = DEFAULT_TRAIN_WITH_MLE_METHOD,
         atol: float = DEFAULT_ATOL,
         rtol: float = DEFAULT_RTOL,
@@ -1242,7 +1289,11 @@ class CFMExecutor:
             time_grid_mle_ode = time_grid.to(self.device)
             logger.info(f"  Tolerances for MLE adaptive solver: atol={atol}, rtol={rtol}")
 
-        time_grid_mle_scheduled = timestep_scheduler(time_grid_mle_ode, a=3.0)
+        time_grid_mle_scheduled = timestep_scheduler(
+            time_grid_mle_ode,
+            mu=timestep_schedule_mu,
+            sigma=timestep_schedule_sigma,
+        )
         logger.info(f"  Time Grid for MLE (Scheduled for ODE): {time_grid_mle_scheduled.tolist()}")
 
         # --- Standard CFM Training Setup ---
@@ -1452,10 +1503,11 @@ class CFMExecutor:
         atol: float = DEFAULT_ATOL,
         rtol: float = DEFAULT_RTOL,
         time_grid: Tensor = DEFAULT_TIME_GRID_FWD,
-        timestep_schedule_factor: float = 0.3,
+        timestep_schedule_mu: float = 0.0,
+        timestep_schedule_sigma: float = 1.0,
+        for_gpu_warmup: bool = False,
         do_log: bool = True,
         reshape: bool = True,
-        **model_extras
     ) -> Tensor:
         """Generates samples by solving the ODE from $p_0$ to $p_1$.
 
@@ -1476,12 +1528,12 @@ class CFMExecutor:
             atol: Absolute tolerance for adaptive ODE solvers.
             rtol: Relative tolerance for adaptive ODE solvers.
             time_grid: Time grid for the forward ODE solve (e.g., from 0.0 to 1.0).
-            timestep_schedule_factor: Factor for scheduling the time grid.
+            timestep_schedule_mu: Factor for scheduling the time grid.
+            timestep_schedule_sigma: Factor for scheduling the time grid.
+            for_gpu_warmup: If True, performs a GPU warmup without actual sampling.
             do_log: Whether to log the solving process.
             reshape: If True, attempts to reshape the output tensor of
                 generated samples based on `num_samples`.
-            **model_extras: Additional keyword arguments passed to the model
-                during velocity field evaluation (e.g., `conditions`).
 
         Returns:
             A Tensor containing the generated samples. The shape might be
@@ -1496,6 +1548,9 @@ class CFMExecutor:
         self.model.eval() # Ensure model is in evaluation mode
         solver = self._setup_solver(do_log=do_log)
         all_solutions_list: List[Tensor] = []
+
+        if for_gpu_warmup:
+            logger.info("Performing GPU warmup. No actual sampling will be done.")
 
         # Determine original and scheduled time grid for ODE solving
         if do_log:
@@ -1515,7 +1570,8 @@ class CFMExecutor:
         # 'a=0.3' is a hyperparameter for this specific scheduler, may differ from likelihood's 'a'
         time_grid_scheduled_for_ode = timestep_scheduler(
             time_grid_ode,
-            a=timestep_schedule_factor
+            mu=timestep_schedule_mu,
+            sigma=timestep_schedule_sigma,
         )
         if do_log:
             logger.info(f"  Time Grid (Scheduled for ODE): {time_grid_scheduled_for_ode.tolist()}")
@@ -1527,12 +1583,21 @@ class CFMExecutor:
                 leave=False, total=len(solve_loader)
             )
             for batch_content in progress_bar:
-                current_model_extras = model_extras.copy() # Avoid modifying dict in loop
+                current_model_extras = dict()
                 if isinstance(batch_content, (list, tuple)):
                     x_init_batch = batch_content[0].to(self.device)
                     if len(batch_content) > 1:
-                        temp = batch_content[1].to(self.device)
-                        current_model_extras['conditions'] = [1 + torch.exp(-0.5 * temp), 10 * torch.ones_like(temp)]
+                        if isinstance(batch_content[1], Tensor):
+                            conds = batch_content[1].to(self.device)
+                            current_model_extras['conditions'] = [conds,]
+                        elif isinstance(batch_content[1], list):
+                            conds = [c.to(self.device) for c in batch_content[1]]
+                            current_model_extras['conditions'] = conds
+                        else:
+                            raise TypeError(
+                                "Label must be a Tensor or a list of Tensors. "
+                                f"Received type: {type(batch_content[1])}"
+                            )
                 else:
                     x_init_batch = batch_content.to(self.device)
                     current_model_extras.pop('conditions', None) # Clear if not provided
@@ -1551,6 +1616,14 @@ class CFMExecutor:
                 )
                 # Move to CPU before appending to save GPU memory, esp. if solutions are large
                 all_solutions_list.append(solution_batch.cpu())
+
+                if for_gpu_warmup:
+                    break
+
+        if for_gpu_warmup:
+            logger.info("GPU warmup completed. Returning empty tensor.")
+            # Return an empty tensor for GPU warmup, shape can be adjusted if needed
+            return torch.empty((0,), dtype=torch.float32, device='cpu')
 
         if not all_solutions_list:
              logger.warning(

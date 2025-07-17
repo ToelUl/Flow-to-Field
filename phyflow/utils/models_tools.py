@@ -46,7 +46,7 @@ def profile_model(
     This function moves the model and dummy inputs to the same device,
     uses THOP to compute total parameters and FLOPs, then prints:
       - parameter count in millions (M)
-      - FLOPs in millions (M)
+      - FLOPs in billions (G)
       - estimated memory usage in megabytes (MB), assuming 4 bytes per parameter
 
     Args:
@@ -89,14 +89,14 @@ def profile_model(
         flops, params = profile(profiling_model, inputs=inputs, verbose=False)
 
     # Convert to human-readable units
-    params_m = params / 1e6
-    flops_m = flops / 1e6
+    params_m = params / 1e3
+    flops_m = flops / 1e9
     mem_bytes = params * 4  # float32 = 4 bytes
     mem_mb = mem_bytes / (1024 ** 2)
 
     # Print results
-    print(f"Parameters:                           {params_m:.2f} M")
-    print(f"FLOPs (floating point operations):    {flops_m:.2f} M")
+    print(f"Parameters:                           {params_m:.2f} K")
+    print(f"FLOPs (floating point operations):    {flops_m:.4f} G")
     print(f"Estimated memory usage (params only): {mem_mb:.2f} MB")
 
 

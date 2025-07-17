@@ -3,34 +3,41 @@ import matplotlib.pyplot as plt
 from torch.distributions import Normal
 
 
-def logit_normal_sampler(shape: tuple, sigma_logit: float = 1.0, device = 'cpu') -> torch.Tensor:
-    """Generates samples from a Logit-Normal distribution centered at 0.5.
+def logit_normal_sampler(
+        shape: tuple,
+        mu_logit: float = 0.0,
+        sigma_logit: float = 1.0,
+        device: str = 'cpu') -> torch.Tensor:
+    """Generates samples from a Logit-Normal distribution.
 
-    This function uses the Logit-Normal distribution to generate samples within
-    the (0, 1) interval that are concentrated around 0.5. This is achieved by:
-    1. Sampling from a Normal distribution with mean 0 and standard deviation
-       `sigma_logit`: `X ~ Normal(0, sigma_logit)`.
-    2. Applying the sigmoid function: `Z = sigmoid(X) = 1 / (1 + exp(-X))`.
+    This function produces samples in the (0, 1) interval by transforming
+    samples from a Normal distribution. The process is as follows:
+    1. Sample from a Normal distribution: `X ~ Normal(mu_logit, sigma_logit)`.
+    2. Apply the standard sigmoid function: `Z = sigmoid(X) = 1 / (1 + exp(-X))`.
 
-    Since sigmoid(0) = 0.5, centering the underlying Normal distribution at 0
-    results in Logit-Normal samples concentrated around 0.5. The parameter
-    `sigma_logit` controls the degree of concentration: smaller values lead to
-    samples being more tightly clustered around 0.5.
+    The `mu_logit` parameter controls the mean of the underlying Normal
+    distribution, which determines the location of the mode (peak) of the
+    Logit-Normal samples. The center of the distribution is `sigmoid(mu_logit)`.
+    For example, a `mu_logit` of 0 centers the distribution around 0.5.
 
-    This approach provides a way to generate samples concentrated at 0.5 within
-    (0, 1) based on the Normal/Log-Normal family of distributions.
+    The `sigma_logit` parameter controls the standard deviation of the Normal
+    distribution, which dictates how concentrated the samples are around the
+    center. Smaller values result in a tighter clustering.
 
     Args:
         shape (tuple): The desired shape of the output tensor.
+        mu_logit (float, optional): The mean of the underlying Normal
+            distribution. This controls the center of the Logit-Normal
+            distribution. Defaults to 0.0.
         sigma_logit (float, optional): The standard deviation for the underlying
-            Normal(0, sigma_logit) distribution. Must be > 0. Controls the
-            concentration around 0.5 (smaller sigma -> more concentrated).
-            Defaults to 1.0.
-        device (str, optional): The device on which to return the sampling.
+            Normal distribution. Must be > 0. Controls the concentration of
+            samples. Defaults to 1.0.
+        device (str, optional): The device on which to create the tensor.
+            Defaults to 'cpu'.
 
     Returns:
         torch.Tensor: A tensor of the specified shape containing samples from the
-                      Logit-Normal distribution centered at 0.5.
+                      Logit-Normal distribution.
 
     Raises:
         ValueError: If sigma_logit is not positive.
@@ -39,9 +46,8 @@ def logit_normal_sampler(shape: tuple, sigma_logit: float = 1.0, device = 'cpu')
     if not sigma_logit > 0:
         raise ValueError(f"Parameter sigma_logit must be positive, but got {sigma_logit}")
 
-    # --- Define the base Normal distribution centered at 0 ---
-    # Use 0.0 to ensure float type for the mean
-    base_normal_dist = Normal(0.0, sigma_logit)
+    # --- Define the base Normal distribution ---
+    base_normal_dist = Normal(mu_logit, sigma_logit)
 
     # --- Generate samples from the Normal distribution ---
     normal_samples = base_normal_dist.sample(shape)
@@ -54,32 +60,44 @@ def logit_normal_sampler(shape: tuple, sigma_logit: float = 1.0, device = 'cpu')
 if __name__ == "__main__":
     # --- Configuration ---
     num_samples = 1000000
-    # Standard deviation for the underlying Normal(0, sigma) distribution.
-    # Smaller values (e.g., 0.3) lead to higher concentration around 0.5.
-    # Larger values (e.g., 1.0) lead to wider spread.
+    # The mean of the underlying Normal distribution.
+    # This determines the center of the Logit-Normal samples.
+    # e.g., mu_logit=0.0 -> center=0.5
+    # e.g., mu_logit=2.0 -> center=sigmoid(2.0) approx 0.88
+    param_mu_logit = -1.1
+    # The standard deviation of the underlying Normal distribution.
+    # Smaller values lead to higher concentration around the center.
     param_sigma_logit = 1.0
 
+    # --- Calculate Distribution Center ---
+    center_value = torch.sigmoid(torch.tensor(param_mu_logit)).item()
+
     # --- Generate Samples ---
-    centered_samples = logit_normal_sampler(
+    samples = logit_normal_sampler(
         (num_samples,),
+        mu_logit=param_mu_logit,
         sigma_logit=param_sigma_logit
     )
 
     # --- Visualization ---
-    plt.figure(figsize=(10, 6))
-    plt.hist(centered_samples.cpu().numpy(), bins=1000, density=True, alpha=0.75,
-             color='mediumseagreen', label=f'LogitNormal(mu=0, sigma={param_sigma_logit:.2f}) Samples')
+    plt.figure(figsize=(12, 7))
+    plt.hist(samples.cpu().numpy(), bins=1000, density=True, alpha=0.75,
+             color='mediumseagreen')
     plt.xlabel('Value')
     plt.ylabel('Density')
 
     # Construct the title dynamically
-    title = (f'Logit-Normal Distribution Centered at 0.5\n'
-             f'(Normal mean=0.0, sigma={param_sigma_logit:.2f})')
+    title = (f'Logit-Normal Distribution\n'
+             f'Center = sigmoid({param_mu_logit:.1f}) ≈ {center_value:.2f}, '
+             f'Underlying Normal(mean={param_mu_logit:.1f}, sigma={param_sigma_logit:.1f})')
     plt.title(title)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+    # Add a vertical line at the calculated center
+    plt.axvline(center_value, color='red', linestyle='--', linewidth=1.5,
+                label=f'Center ≈ {center_value:.2f}')
     plt.legend()
-    plt.ylim(bottom=0) # Ensure y-axis starts at 0
-    plt.axvline(0.5, color='red', linestyle='--', linewidth=1.5, label='Center (0.5)') # Add vertical line at 0.5
-    plt.legend() # Show legend again to include the vertical line label
+    plt.ylim(bottom=0)
+    plt.xlim(0, 1) # Samples are within (0, 1)
     plt.tight_layout()
     plt.show()
