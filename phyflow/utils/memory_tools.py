@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Any, List
+import math
 import gc
 
 
@@ -184,6 +185,35 @@ def estimate_max_batch_size(
     # Ensure the result is a non-negative integer and does not exceed the dataset size
     max_batch = int(max(0, max_batch))
     return min(max_batch, num_data)
+
+
+def find_closest_factor(a, b):
+    """
+    Given two numbers, A and B, find the factor of A that is closest to B.
+
+    Args:
+        a (int): The number from which to find the factors.
+        b (int): The number to which the factor should be closest.
+
+    Returns:
+        int: The factor of A that is closest to B.
+             Returns None if A is less than or equal to 0.
+    """
+    if a <= 0:
+        return None
+
+    factors = set()
+    # Iterate from 1 up to the square root of 'a' to find factors efficiently.
+    for i in range(1, int(math.sqrt(a)) + 1):
+        if a % i == 0:
+            factors.add(i)
+            factors.add(a // i)
+
+    # Use the min() function with a lambda key to find the factor with the
+    # smallest absolute difference from 'b'.
+    closest_factor = min(factors, key=lambda x: abs(x - b))
+
+    return closest_factor
 
 
 def clear_cuda_cache(del_vars: Optional[List[Any]] = None) -> None:
