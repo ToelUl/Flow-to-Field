@@ -739,7 +739,7 @@ class FlexibleDiT(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        t: torch.Tensor,
+        time: torch.Tensor,
         conditions: Union[torch.Tensor, Sequence[torch.Tensor]],
         attn_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -747,7 +747,7 @@ class FlexibleDiT(nn.Module):
 
         Args:
             x: Input latent tensor (B, C_in, H, W).
-            t: Timestep tensor (B,).
+            time: Timestep tensor (B,).
             conditions: Single condition tensor (B,) or sequence of tensors.
             attn_mask: Optional attention mask (B, N, N) or (N, N).
 
@@ -756,7 +756,7 @@ class FlexibleDiT(nn.Module):
         """
         model_device = next(self.parameters()).device
         x = x.to(model_device)
-        t = t.to(model_device)
+        t = time.to(model_device)
         batch_size = x.shape[0]
 
         # Input validation check
