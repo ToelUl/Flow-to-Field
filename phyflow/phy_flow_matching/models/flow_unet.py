@@ -225,7 +225,7 @@ class RoPEMixed(nn.Module):
         rotated_k = k * cos + rotate_half(k) * sin
         return rotated_q, rotated_k
 
-
+@torch.compile
 class ConditionalMSAWithRoPE(nn.Module):
     """A Multi-Head Self-Attention block for fusing conditional embeddings with RoPE."""
     def __init__(self, dim: int, num_heads: int, seq_len: int, qkv_bias: bool = False):
@@ -261,7 +261,7 @@ class ConditionalMSAWithRoPE(nn.Module):
         processed_sequence = self.seq_combine_proj(attn_output).squeeze(-1)
         return processed_sequence
 
-
+@torch.compile
 class MSAWithRoPE(nn.Module):
     """A Multi-Head Self-Attention module integrated with RoPE-Mixed."""
     def __init__(self,
@@ -329,7 +329,12 @@ class Mlp(nn.Module):
         x = self.pw_conv2(x)
         return x
 
-
+@torch.compile(
+    options={
+        "epilogue_fusion": True,
+        "max_autotune": True,
+    }
+)
 class ResnetBlock(nn.Module):
     """
     A unified ResNet-like block that can optionally include a self-attention mechanism.
@@ -515,7 +520,11 @@ def lecun_init(module: nn.Module) -> None:
             init.zeros_(module.bias)
 
 
-@torch.compile
+@torch.compile(
+    options={
+        "shape_padding": True,
+    }
+)
 class FlowUNet(nn.Module):
     """A U-Net model with a Diffusion Transformer (DiT) like architecture.
 
