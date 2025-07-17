@@ -9,7 +9,9 @@ from .utils import (
     lock_all_non_convolutional_layers,
     unlock_all_layers,
     estimate_max_batch_size,
-    clear_cuda_cache
+    find_closest_factor,
+    clear_cuda_cache,
+    get_complete_device_info,
 )
 from .monte_carlo import XYModel, IsingModel, PottsModel, MCDataset, MCDataGenerator
 from .phy_flow_matching import (
@@ -37,6 +39,7 @@ __all__ = [
     'lock_all_non_convolutional_layers',
     'unlock_all_layers',
     'estimate_max_batch_size',
+    'find_closest_factor',
     'clear_cuda_cache',
     'XYModel',
     'IsingModel',
