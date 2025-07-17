@@ -37,7 +37,6 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 # ==============================================================================
 # Custom Normalization Layers
 # ==============================================================================
-@torch.compile
 class RMSNorm2d(nn.Module):
     """A 2D Root Mean Square Layer Normalization module.
 
@@ -106,6 +105,7 @@ class SinusoidalPosEmb(nn.Module):
         if not isinstance(embedding_dim, int) or embedding_dim <= 0:
             raise ValueError(f"embedding_dim must be a positive integer, got {embedding_dim}")
         # Ensure embedding_dim is even
+        self.max_period = max_period
         self.embedding_dim = embedding_dim if embedding_dim % 2 == 0 else embedding_dim + 1
         half_dim = self.embedding_dim // 2
         freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32) / half_dim)
@@ -124,7 +124,7 @@ class SinusoidalPosEmb(nn.Module):
         args = x.float().unsqueeze(1) * self.freqs.unsqueeze(0) * self.factor
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
-@torch.compile
+
 class MLPEmbedder(nn.Module):
     """
     A Multi-Layer Perceptron (MLP) embedder for input features.
@@ -141,7 +141,7 @@ class MLPEmbedder(nn.Module):
         h = self.mlp_emb_out_layer(h)
         return h
 
-@torch.compile
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotates half the hidden dimensions of the input tensor.
 
@@ -162,7 +162,7 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     )
     return x_rotated_pairs.flatten(start_dim=-2)
 
-@torch.compile
+
 class RoPE(nn.Module):
     """Implements the Rotary Position Embedding (RoPE)."""
     def __init__(self, dim: int, base: int = 10000):
@@ -190,8 +190,8 @@ class RoPE(nn.Module):
         rotated_k = k * cos + rotate_half(k) * sin
         return rotated_q, rotated_k
 
-@torch.compile
-class RoPE_Mixed(nn.Module):
+
+class RoPEMixed(nn.Module):
     """Implements the mixed-axis Rotary Position Embedding (RoPE-Mixed)."""
     def __init__(self, dim: int):
         super().__init__()
@@ -225,7 +225,7 @@ class RoPE_Mixed(nn.Module):
         rotated_k = k * cos + rotate_half(k) * sin
         return rotated_q, rotated_k
 
-@torch.compile
+
 class ConditionalMSAWithRoPE(nn.Module):
     """A Multi-Head Self-Attention block for fusing conditional embeddings with RoPE."""
     def __init__(self, dim: int, num_heads: int, seq_len: int, qkv_bias: bool = False):
@@ -261,7 +261,7 @@ class ConditionalMSAWithRoPE(nn.Module):
         processed_sequence = self.seq_combine_proj(attn_output).squeeze(-1)
         return processed_sequence
 
-@torch.compile
+
 class MSAWithRoPE(nn.Module):
     """A Multi-Head Self-Attention module integrated with RoPE-Mixed."""
     def __init__(self,
@@ -271,10 +271,6 @@ class MSAWithRoPE(nn.Module):
                  padding_mode: str = "circular",
                  ):
         super().__init__()
-        if channels <= 0:
-            self.is_identity = True
-            return
-        self.is_identity = False
         assert channels % num_heads == 0, f"Channels ({channels}) must be divisible by num_heads ({num_heads})."
         self.channels = channels
         self.num_heads = num_heads
@@ -289,11 +285,9 @@ class MSAWithRoPE(nn.Module):
         )
         self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
-        self.rope = RoPE_Mixed(dim=self.head_dim)
+        self.rope = RoPEMixed(dim=self.head_dim)
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.is_identity:
-            return x
         B, C, H, W = x.shape
         N = H * W
         qkv = self.qkv_projection(x).chunk(3, dim=1)
@@ -308,7 +302,7 @@ class MSAWithRoPE(nn.Module):
         out = out.transpose(-1, -2).reshape(B, C, H, W)
         return x + out
 
-@torch.compile
+
 class Mlp(nn.Module):
     """Multi-Layer Perceptron for spatial features."""
     def __init__(
@@ -353,9 +347,6 @@ class ResnetBlock(nn.Module):
         self.channels = channels
         self.emb_dim = emb_dim
         self.use_attention = attention
-        self.is_identity = channels <= 0
-        if self.is_identity:
-            return
 
         self.norm1 = RMSNorm2d(num_features=channels, eps=1e-6, elementwise_affine=False)
 
@@ -390,10 +381,7 @@ class ResnetBlock(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        if self.is_identity:
-            return x
         shift1, scale1, gate1, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(emb).chunk(6, dim=1)
-        # shift1, scale1, gate1, shift_mlp, scale_mlp, gate_mlp = self.mod_norm(self.adaLN_modulation(emb)).chunk(6, dim=1)
         h_pre = self.norm1(x)
         h_pre = modulate(h_pre, shift1, scale1)
         h_processed = self.attn_or_conv(h_pre)
@@ -403,7 +391,7 @@ class ResnetBlock(nn.Module):
         h_mlp = self.mlp(h_mlp)
         return h + gate_mlp.unsqueeze(-1).unsqueeze(-1) * h_mlp
 
-@torch.compile
+
 class ConditionalChannelProjection(nn.Module):
     """Conditional channel projection layer."""
     def __init__(
@@ -415,9 +403,6 @@ class ConditionalChannelProjection(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.is_identity = in_channels == 0 or out_channels == 0
-        if self.is_identity:
-            return
 
         self.norm = RMSNorm2d(num_features=in_channels, eps=1e-6, elementwise_affine=False)
         modulation_dim = in_channels * 2
@@ -431,13 +416,11 @@ class ConditionalChannelProjection(nn.Module):
         self.act = nn.SELU()
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        if self.is_identity:
-            return x
         shift, scale = self.adaLN_modulation(emb).chunk(2, dim=1)
         x = modulate(self.norm(x), shift, scale)
         return self.act(self.conv(x))
 
-@torch.compile
+
 class FinalLayer(nn.Module):
     """Final layer of the U-Net"""
     def __init__(
@@ -450,9 +433,6 @@ class FinalLayer(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.is_identity = in_channels == 0 or out_channels == 0
-        if self.is_identity:
-            return
 
         self.norm = RMSNorm2d(num_features=in_channels, eps=1e-6, elementwise_affine=False)
         modulation_dim = in_channels * 2
@@ -470,14 +450,13 @@ class FinalLayer(nn.Module):
         )
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        if self.is_identity:
-            return x
         shift, scale = self.adaLN_modulation(emb).chunk(2, dim=1)
         x = modulate(self.norm(x), shift, scale)
         return self.conv_out(self.act(x))
 
-@torch.compile
+
 class ConditionalDownsample(nn.Module):
+    """Conditional downsampling layer using depthwise convolution and pixel unshuffle."""
     def __init__(
         self,
         in_channels: int,
@@ -488,9 +467,6 @@ class ConditionalDownsample(nn.Module):
     ):
         super().__init__()
         self.scale_factor = scale_factor
-        self.is_identity = in_channels == 0 or out_channels == 0
-        if self.is_identity:
-            return
 
         self.dw_conv = nn.Conv2d(
             in_channels, in_channels,
@@ -502,13 +478,11 @@ class ConditionalDownsample(nn.Module):
         self.pixel_shuffle = nn.PixelUnshuffle(scale_factor)
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        if self.is_identity:
-            return x
         return self.pixel_shuffle(self.channel_proj(self.dw_conv(x), emb))
 
-@torch.compile
+
 class ConditionalUpsample(nn.Module):
-    """Upsampling layer using PixelShuffle."""
+    """Conditional upsampling layer using pixel shuffle and channel projection."""
     def __init__(
         self,
         in_channels: int,
@@ -518,9 +492,6 @@ class ConditionalUpsample(nn.Module):
     ):
         super().__init__()
         self.scale_factor = scale_factor
-        self.is_identity = in_channels == 0 or out_channels == 0
-        if self.is_identity:
-            return
 
         self.channel_proj = ConditionalChannelProjection(
             in_channels, out_channels * (scale_factor ** 2), emb_dim
@@ -529,8 +500,6 @@ class ConditionalUpsample(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        if self.is_identity:
-            return x
         return self.act(self.pixel_shuffle(self.channel_proj(x, emb)))
 
 
@@ -548,8 +517,26 @@ def lecun_init(module: nn.Module) -> None:
 
 @torch.compile
 class FlowUNet(nn.Module):
-    """Diffusion Transformer like U-Net with Rotary Embedding."""
+    """A U-Net model with a Diffusion Transformer (DiT) like architecture.
 
+    This model implements a U-Net structure where the traditional ResNet blocks
+    are replaced with blocks inspired by Diffusion Transformers. These blocks
+    use adaptive layer normalization (adaLN) to condition on time and other
+    embeddings, and can optionally replace convolutions with multi-head
+    self-attention (`MSAWithRoPE`) at deeper levels of the network. It supports
+    multiple conditional inputs, which are fused with the time embedding using
+    another attention layer before being passed to the network blocks.
+
+    Attributes:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels in the output tensor.
+        model_channels (int): The base number of channels in the model.
+        num_levels (int): The number of downsampling/upsampling levels.
+        start_attn_level (int): The level at which to start using attention blocks.
+        num_blocks (int): Number of ResnetBlocks per level.
+        emb_dim (int): The dimension of the conditional embeddings.
+        num_conditions (int): The number of expected conditional inputs.
+    """
     def __init__(
             self,
             in_channels: int = 1,
@@ -564,6 +551,29 @@ class FlowUNet(nn.Module):
             emb_dim: Optional[int] = None,
             padding_mode: str = "circular",
     ):
+        """Initializes the FlowUNet model.
+
+        Args:
+            in_channels: Number of channels in the input tensor.
+            out_channels: Number of channels in the output tensor.
+            model_channels: The base number of channels for the first convolution.
+            downsample_out_ch_mult: A sequence of multipliers for the number of
+                channels at each downsampling level and the bottleneck.
+            start_attn_level: The downsampling level (0-indexed) at which to
+                start using self-attention blocks instead of convolutions.
+            num_blocks: The number of `ResnetBlock`s per resolution level.
+            dropout: The dropout rate used in the MLP of the `ResnetBlock`.
+            num_heads: The number of heads for the self-attention blocks.
+            num_conditions: The number of conditional inputs the model expects,
+                excluding the time embedding.
+            emb_dim: The dimension for the time and conditional embeddings. If
+                None, defaults to `model_channels`.
+            padding_mode: The padding mode for all convolutions.
+
+        Raises:
+            ValueError: If `downsample_out_ch_mult` has fewer than two elements,
+                or if `start_attn_level` or `num_blocks` are not positive.
+        """
         super().__init__()
         if len(downsample_out_ch_mult) < 2:
             raise ValueError("downsample_out_ch_mult must have at least two elements.")
@@ -745,6 +755,7 @@ class TestCoreModules(unittest.TestCase):
         self.batch_size, self.channels, self.height, self.width = 2, 32, 16, 16
         self.emb_dim, self.seq_len = 64, 10
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     def test_rms_norm_2d(self):
         norm_affine = RMSNorm2d(num_features=self.channels).to(self.device)
         norm_no_affine = RMSNorm2d(num_features=self.channels, elementwise_affine=False).to(self.device)
@@ -755,6 +766,7 @@ class TestCoreModules(unittest.TestCase):
         self.assertEqual(output_no_affine.shape, x.shape)
         self.assertIsNotNone(norm_affine.scale)
         self.assertIsNone(norm_no_affine.scale)
+
     def test_sinusoidal_pos_emb(self):
         emb = SinusoidalPosEmb(self.emb_dim - 1).to(self.device)
         self.assertEqual(emb.embedding_dim, self.emb_dim)
@@ -762,6 +774,7 @@ class TestCoreModules(unittest.TestCase):
         output = emb(x)
         self.assertEqual(output.shape, (self.batch_size, self.emb_dim))
         with self.assertRaises(ValueError): SinusoidalPosEmb(0)
+
     def test_rotary_embedding_1d(self):
         rope = RoPE(dim=self.emb_dim).to(self.device)
         q = torch.randn(self.batch_size, self.seq_len, self.emb_dim).to(self.device)
@@ -771,6 +784,7 @@ class TestCoreModules(unittest.TestCase):
         self.assertEqual(k_rot.shape, k.shape)
         self.assertFalse(torch.allclose(q_rot, q))
         with self.assertRaises(ValueError): RoPE(dim=31)
+
     def test_msa_with_rope(self):
         msa = MSAWithRoPE(channels=self.channels, num_heads=4).to(self.device)
         x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
@@ -778,6 +792,7 @@ class TestCoreModules(unittest.TestCase):
         self.assertEqual(output.shape, x.shape)
         with self.assertRaises(AssertionError): MSAWithRoPE(channels=30, num_heads=4)
         with self.assertRaises(AssertionError): MSAWithRoPE(channels=32, num_heads=5)
+
     def test_mlp(self):
         mlp = Mlp(in_channels=self.channels, out_channels=self.channels * 2).to(self.device)
         x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
@@ -791,11 +806,8 @@ class TestBuildingBlocks(unittest.TestCase):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def test_unified_resnet_block(self):
-        """測試合併後的 ResnetBlock 的兩種模式"""
         x = torch.randn(self.batch_size, self.channels, self.height, self.width).to(self.device)
         emb = torch.randn(self.batch_size, self.emb_dim).to(self.device)
-
-        # 測試 attention=True (原 AttentionResnetBlock)
         block_with_attn = ResnetBlock(
             channels=self.channels, emb_dim=self.emb_dim, attention=True, num_heads=4
         ).to(self.device)
@@ -803,8 +815,6 @@ class TestBuildingBlocks(unittest.TestCase):
         self.assertEqual(output_attn.shape, x.shape)
         self.assertTrue(block_with_attn.use_attention)
         self.assertIsInstance(block_with_attn.attn_or_conv, MSAWithRoPE)
-
-        # 測試 attention=False (原 ResnetBlock)
         block_without_attn = ResnetBlock(
             channels=self.channels, emb_dim=self.emb_dim, attention=False
         ).to(self.device)
@@ -812,12 +822,6 @@ class TestBuildingBlocks(unittest.TestCase):
         self.assertEqual(output_no_attn.shape, x.shape)
         self.assertFalse(block_without_attn.use_attention)
         self.assertIsInstance(block_without_attn.attn_or_conv, nn.Conv2d)
-
-        # 測試 identity case (channels=0)
-        block_identity = ResnetBlock(channels=0, emb_dim=0, attention=True)
-        output_identity = block_identity(x, emb)
-        self.assertTrue(torch.allclose(x, output_identity))
-        self.assertTrue(block_identity.is_identity)
 
     def test_conditional_downsample(self):
         down = ConditionalDownsample(
@@ -865,7 +869,6 @@ class TestFlowUNet(unittest.TestCase):
             model(x, time, conditions=[conditions[0]])
 
     def test_architecture_based_on_start_attn_level(self):
-        """測試 start_attn_level 是否能正確控制 ResnetBlock 中的 attention 旗標"""
         num_levels = len(self.base_config["downsample_out_ch_mult"]) - 1
         self.assertEqual(num_levels, 3)
         test_cases = [
@@ -877,17 +880,14 @@ class TestFlowUNet(unittest.TestCase):
         for case in test_cases:
             with self.subTest(desc=case["desc"]):
                 model = FlowUNet(**self.base_config, start_attn_level=case["start_attn_level"])
-                # 檢查 Down blocks
                 for level_idx, level_blocks in enumerate(model.down_blocks):
                     should_use_attention = level_idx >= case["start_attn_level"]
                     for block in level_blocks:
                         self.assertIsInstance(block, ResnetBlock)
                         self.assertEqual(block.use_attention, should_use_attention)
-                # 檢查 Middle blocks
                 for block in model.middle_blocks:
                     self.assertIsInstance(block, ResnetBlock)
                     self.assertTrue(block.use_attention, "Middle blocks should always use attention")
-                # 檢查 Up blocks
                 for i, level_blocks in enumerate(model.up_blocks):
                     level_idx = num_levels - 1 - i
                     should_use_attention = level_idx >= case["start_attn_level"]
