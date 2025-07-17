@@ -188,7 +188,7 @@ class XYModel(MonteCarloSampler):
         self.total_trials.zero_()
         del factor, new_max_delta, current_rate
 
-    def compute_energy(self) -> Tensor:
+    def compute_energy(self, theta: Tensor = None) -> Tensor:
         r"""Compute the total energy for the XY model.
 
         The energy is given by:
@@ -198,7 +198,7 @@ class XYModel(MonteCarloSampler):
         Returns:
             Tensor: Energy tensor of shape [batch_size, n_chains].
         """
-        theta = self.spins.to(self.device)
+        theta = self.spins.to(self.device) if theta is None else theta.to(self.device)
         t_top = torch.roll(theta, shifts=1, dims=3)
         t_right = torch.roll(theta, shifts=-1, dims=2)
         E_local = torch.cos(theta - t_top) + torch.cos(theta - t_right)
