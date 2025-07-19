@@ -1556,14 +1556,17 @@ class CFMExecutor:
         if do_log:
             logger.info("Starting sample generation (solving ODE)...")
             logger.info(f"  Solver: {method}, Time Grid (Original): {time_grid.tolist()}")
-            if method in ['euler', 'midpoint', 'rk4', 'heun2', 'heun3']: # Fixed-step
-                time_grid_ode = torch.linspace(
-                    time_grid[0].item(), time_grid[-1].item(),
-                    steps=num_steps + 1, device=self.device
-                )
+
+        if method in ['euler', 'midpoint', 'rk4', 'heun2', 'heun3']: # Fixed-step
+            time_grid_ode = torch.linspace(
+                time_grid[0].item(), time_grid[-1].item(),
+                steps=num_steps + 1, device=self.device
+            )
+            if do_log:
                 logger.info(f"  Time Grid (Fixed Steps): {time_grid_ode.tolist()}")
-            else: # Adaptive
-                time_grid_ode = time_grid.to(self.device)
+        else: # Adaptive
+            time_grid_ode = time_grid.to(self.device)
+            if do_log:
                 logger.info(f"  Tolerances for adaptive solver: atol={atol}, rtol={rtol}")
 
         # Apply timestep scheduling for sampling (e.g., variance exploding schedule)

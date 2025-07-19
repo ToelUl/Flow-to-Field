@@ -100,9 +100,9 @@ class MCDataGenerator(nn.Module):
             pt_interval = 1
             pt_prob = 0.1
             tau_pt = pt_interval / pt_prob
-            tau = L**2
+            tau = L**2.2 # Example autocorrelation time for XY model
             tau_eff = (tau_pt * tau) / (tau_pt + tau)
-            factor_therm = 50
+            factor_therm = 30
             factor_decorrelate = 2
             n_therm = int(factor_therm * tau)
             decorrelate = int(factor_decorrelate * tau_eff)
