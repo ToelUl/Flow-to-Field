@@ -72,7 +72,8 @@ class MCDataGenerator(nn.Module):
                  ensemble_number: int,
                  device: str = "cuda:0",
                  q: int = None,
-                 n_chains: int = 10) -> None:
+                 n_chains: int = 10,
+                 pt_enabled: bool =None) -> None:
         """
         Runs the Monte Carlo simulation and data generation process.
 
@@ -86,6 +87,7 @@ class MCDataGenerator(nn.Module):
             device: The device to run the simulation on (e.g., "cuda:0" or "cpu").
             q: Number of states for Potts model (default is None, indicating not used).
             n_chains: Number of chains to run in parallel (default is 10).
+            pt_enabled (bool, optional): Enable parallel tempering.
         """
         start_total_time = time.time()
 
@@ -93,10 +95,8 @@ class MCDataGenerator(nn.Module):
         T = torch.linspace(T_start, T_end, int((T_end - T_start) // precision) + 1, device=device)
         n_temps = len(T)
 
-        pt_enabled = False # Default, enabled for XY below
-
         if self.sampler_name == "XYModel":
-            pt_enabled = True # Enable parallel tempering for XY
+            pt_enabled = True if pt_enabled is None else pt_enabled
             pt_interval = 1
             pt_prob = 0.1
             tau_pt = pt_interval / pt_prob
