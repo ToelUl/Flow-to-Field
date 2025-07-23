@@ -453,7 +453,7 @@ class XYModel(MonteCarloSampler):
             plt.style.use('seaborn-v0_8-pastel')
             fig, ax = plt.subplots()
         if plot_t_bkt:
-            tc_bkt = 0.893  # BKT transition temperature
+            tc_bkt = 0.8935  # BKT transition temperature
             ax.axvline(tc_bkt, color='#A0FFAC', linestyle='--', label=f'$T_{{BKT}}={tc_bkt:.3f}$')
         if plot_first_derivative_peak:
             E_tensor_len = len(E_tensor)
@@ -500,7 +500,7 @@ class XYModel(MonteCarloSampler):
             fig, ax = plt.subplots()
         ax.plot(temp_cpu, C, marker='+', linestyle='-', label=r'$C_v$', color='#CDB7FF')
         if plot_t_bkt:
-            tc_bkt = 0.893  # BKT transition temperature
+            tc_bkt = 0.8935  # BKT transition temperature
             ax.axvline(tc_bkt, color='#A0FFAC', linestyle='--', label=f'$T_{{BKT}}={tc_bkt:.3f}$')
         if plot_peak_line:
             peak_cv_idx = C.argmax()
@@ -538,7 +538,7 @@ class XYModel(MonteCarloSampler):
             plt.style.use('seaborn-v0_8-pastel')
             fig, ax = plt.subplots()
         if plot_t_bkt:
-            tc_bkt = 0.893  # BKT transition temperature
+            tc_bkt = 0.8935  # BKT transition temperature
             ax.axvline(tc_bkt, color='#A0FFAC', linestyle='--', label=f'$T_{{BKT}}={tc_bkt:.3f}$')
         if plot_first_derivative_peak:
             rho_s_tensor_trunc = rho_s_tensor[rho_s_tensor > 0.1]
@@ -586,7 +586,7 @@ class XYModel(MonteCarloSampler):
             plt.style.use('seaborn-v0_8-pastel')
             fig, ax = plt.subplots()
         if plot_t_bkt:
-            tc_bkt = 0.893
+            tc_bkt = 0.8935
             ax.axvline(tc_bkt, color='#A0FFAC', linestyle='--', label=f'$T_{{BKT}}={tc_bkt:.3f}$')
         if plot_first_derivative_peak:
             m_tensor_trunc = m_tensor[m_tensor > 0.1]
@@ -633,7 +633,7 @@ class XYModel(MonteCarloSampler):
             plt.style.use('seaborn-v0_8-pastel')
             fig, ax = plt.subplots()
         if plot_t_bkt:
-            tc_bkt = 0.893
+            tc_bkt = 0.8935
             ax.axvline(tc_bkt, color='#A0FFAC', linestyle='--', label=f'$T_{{BKT}}={tc_bkt:.3f}$')
         if plot_peak_line:
             peak_chi_idx = chi.argmax()
@@ -671,7 +671,7 @@ class XYModel(MonteCarloSampler):
             plt.style.use('seaborn-v0_8-pastel')
             fig, ax = plt.subplots()
         if plot_t_bkt:
-            tc_bkt = 0.893
+            tc_bkt = 0.8935
             ax.axvline(tc_bkt, color='#A0FFAC', linestyle='--', label=f'$T_{{BKT}}={tc_bkt:.3f}$')
         ax.plot(temp_cpu, rho_v, marker='+', linestyle='-', label=r'$\rho_v$', color='#CDB7FF')
         ax.set_xlabel('Temperature (T)')
