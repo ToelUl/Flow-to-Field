@@ -1,4 +1,4 @@
-from .classical import XYModel, IsingModel, PottsModel, MCDataset, MCDataGenerator
+from .classical import XYModel, IsingModel, PottsModel, MCDataset, MCDataGenerator, JackknifeAnalysis
 
 __all__ = [
     'XYModel',
@@ -6,4 +6,5 @@ __all__ = [
     'PottsModel',
     'MCDataset',
     'MCDataGenerator',
+    'JackknifeAnalysis',
 ]

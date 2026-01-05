@@ -12,8 +12,9 @@ class JackknifeAnalysis:
     Key Features:
         1. Reduces (B, N, L, L) raw samples to (B, N) time-series observables.
         2. Implements binning to mitigate autocorrelation effects.
-        3. uses Jackknife resampling to correctly estimate errors for non-linear
+        3. Uses Jackknife resampling to correctly estimate errors for non-linear
            observables (e.g., Specific Heat, Susceptibility, Stiffness).
+        4. Computes Vortex Density (rho_v) alongside standard thermodynamic quantities.
 
     Attributes:
         model: The XY model instance containing system parameters.
@@ -58,6 +59,7 @@ class JackknifeAnalysis:
             - 'M': Magnetization density.
             - 'Upsilon_y': Sum of cosine differences along the Y-axis (for stiffness).
             - 'I_y': Sum of sine differences along the Y-axis (for stiffness).
+            - 'Vortex': Vortex density (rho_v).
         """
         # Flatten Batch and Sample dimensions to prevent Out-Of-Memory (OOM) errors.
         # flat_samples shape: [B*N, L, L]
@@ -65,19 +67,26 @@ class JackknifeAnalysis:
 
         obs = {}
 
+        # Helper function for Vortex calculation
+        def principal_value(delta: Tensor) -> Tensor:
+            """Maps angles to the range [-pi, pi]."""
+            return delta.add(torch.pi).remainder(2 * torch.pi).sub(torch.pi)
+
         # Use no_grad as this is purely post-processing analysis.
         with torch.no_grad():
             # 1. Prepare neighbor data
             # theta shape: [B*N, L, L]
             theta = flat_samples
 
-            # For the XY model, we calculate differences between neighbors.
-            # We focus on the Y-direction (dim=-2) for Stiffness calculations.
+            # Calculate rolled tensors for neighbor access
             # t_up corresponds to (i+1, j) -> Y-direction neighbor
             t_up = torch.roll(theta, shifts=-1, dims=-2)
             # t_right corresponds to (i, j+1) -> X-direction neighbor
             t_right = torch.roll(theta, shifts=-1, dims=-1)
+            # t_up_right corresponds to (i+1, j+1) -> Diagonal neighbor (needed for Vortex)
+            t_up_right = torch.roll(t_up, shifts=-1, dims=-1)
 
+            # Differences for Energy/Stiffness
             diff_y = t_up - theta
             diff_x = t_right - theta
 
@@ -95,12 +104,23 @@ class JackknifeAnalysis:
 
             # --- Stiffness Components (unnormalized sums) ---
             # Stiffness Formula: rho_s = (1/L^2) * [ <Upsilon> - (1/T)*<I^2> ]
-            # Upsilon_y = J * sum(cos(theta_i+1 - theta_i))  (Link Term)
-            # I_y = J * sum(sin(theta_i+1 - theta_i))        (Current Term)
-            # Note: We store the raw sums here. Normalization by L^2 and T
-            # occurs during the Jackknife averaging.
             obs['Upsilon_y'] = self.J * torch.cos(diff_y).sum(dim=(1, 2))
             obs['I_y'] = self.J * torch.sin(diff_y).sum(dim=(1, 2))
+
+            # --- Vortex Density (rho_v) ---
+            # Calculate phase differences around a plaquette (counter-clockwise)
+            # Loop: (i,j) -> (i,j+1) -> (i+1,j+1) -> (i+1,j) -> (i,j)
+            d1 = principal_value(t_right - theta)  # Bottom edge
+            d2 = principal_value(t_up_right - t_right)  # Right edge
+            d3 = principal_value(t_up - t_up_right)  # Top edge
+            d4 = principal_value(theta - t_up)  # Left edge
+
+            omega = d1 + d2 + d3 + d4
+            # Integer winding number q = round(omega / 2pi)
+            q = torch.round(omega / (2 * torch.pi))
+
+            # Vortex density: Mean of absolute vorticity per site
+            obs['Vortex'] = q.abs().float().mean(dim=(1, 2))
 
         # Reshape all observables back to [B, N]
         for k, v in obs.items():
@@ -189,7 +209,7 @@ class JackknifeAnalysis:
 
         Returns:
             A dictionary where keys are observable names ('Energy', 'Specific_Heat',
-            etc.) and values are dictionaries containing:
+            'Vortex_Density', etc.) and values are dictionaries containing:
                 - 'mean': Tensor of shape [B]
                 - 'error': Tensor of shape [B]
         """
@@ -209,6 +229,9 @@ class JackknifeAnalysis:
         # Stiffness terms
         up_binned = self._perform_binning(self.raw_obs['Upsilon_y'], bin_size)  # <Upsilon>
         i2_binned = self._perform_binning(self.raw_obs['I_y'] ** 2, bin_size)  # <I^2>
+
+        # Vortex terms
+        v_binned = self._perform_binning(self.raw_obs['Vortex'], bin_size)  # <rho_v>
 
         # --- Define Observable Functions (accepting Jackknife means) ---
 
@@ -230,9 +253,6 @@ class JackknifeAnalysis:
 
         # 3. Specific Heat: Cv
         # Formula: Cv = (L^2 / T^2) * (<E^2> - <E>^2)
-        # Note: raw_obs['E'] is energy per site.
-        # Var(E_total) = L^4 * Var(E_site).
-        # Cv = Var(E_total) / T^2 / L^2 = L^2 * Var(E_site) / T^2.
         def func_cv(args: List[Tensor], t: Tensor) -> Tensor:
             e_mean, e2_mean = args
             var_e = e2_mean - e_mean ** 2
@@ -244,7 +264,6 @@ class JackknifeAnalysis:
 
         # 4. Susceptibility: Chi
         # Formula: Chi = (L^2 / T) * (<M^2> - <M>^2)
-        # Note: raw_obs['M'] is magnetization per site.
         def func_chi(args: List[Tensor], t: Tensor) -> Tensor:
             m_mean, m2_mean = args
             var_m = m2_mean - m_mean ** 2
@@ -256,7 +275,6 @@ class JackknifeAnalysis:
 
         # 5. Spin Stiffness: rho_s
         # Formula: (1/L^2) * [ <Upsilon> - (1/T)*<I^2> ]
-        # Inputs are sum-over-lattice quantities (unnormalized).
         def func_stiffness(args: List[Tensor], t: Tensor) -> Tensor:
             up_mean, i2_mean = args
             return (up_mean - i2_mean / t) / (self.L ** 2)
@@ -265,16 +283,25 @@ class JackknifeAnalysis:
         results['Stiffness']['mean'], results['Stiffness']['error'] = \
             self._compute_jackknife_estimate((up_binned, i2_binned), func_stiffness)
 
+        # 6. Vortex Density: rho_v = <V>
+        # Linear observable, but consistent to process via Jackknife structure.
+        def func_vortex(args: List[Tensor], t: Tensor) -> Tensor:
+            return args[0]
+
+        results['Vortex_Density'] = {}
+        results['Vortex_Density']['mean'], results['Vortex_Density']['error'] = \
+            self._compute_jackknife_estimate((v_binned,), func_vortex)
+
         return results
 
     def print_report(self, results: Dict[str, Dict[str, Tensor]]) -> None:
         """Prints a formatted table of the analysis results."""
         header = (
-            f"{'Temp':<10} | {'Energy':<20} | {'Cv':<20} | "
-            f"{'Magnetization':<20} | {'Chi':<20} | {'Stiffness':<20}"
+            f"{'Temp':<8} | {'Energy':<18} | {'Cv':<18} | {'Mag':<18} | "
+            f"{'Chi':<18} | {'Stiffness':<18} | {'Vortex':<18}"
         )
         print(header)
-        print("-" * 120)
+        print("-" * 140)
 
         # Convert temperature to CPU numpy for iteration
         t_cpu = self.T.cpu().numpy()
@@ -282,15 +309,16 @@ class JackknifeAnalysis:
         def get_fmt_str(name: str, idx: int) -> str:
             val = results[name]['mean'][idx].item()
             err = results[name]['error'][idx].item()
-            return f"{val:.5f} ± {err:.5f}"
+            return f"{val:.4f}±{err:.4f}"
 
         for i, t_val in enumerate(t_cpu):
             row = (
-                f"{t_val:<10.4f} | "
-                f"{get_fmt_str('Energy', i):<20} | "
-                f"{get_fmt_str('Specific_Heat', i):<20} | "
-                f"{get_fmt_str('Magnetization', i):<20} | "
-                f"{get_fmt_str('Susceptibility', i):<20} | "
-                f"{get_fmt_str('Stiffness', i):<20}"
+                f"{t_val:<8.3f} | "
+                f"{get_fmt_str('Energy', i):<18} | "
+                f"{get_fmt_str('Specific_Heat', i):<18} | "
+                f"{get_fmt_str('Magnetization', i):<18} | "
+                f"{get_fmt_str('Susceptibility', i):<18} | "
+                f"{get_fmt_str('Stiffness', i):<18} | "
+                f"{get_fmt_str('Vortex_Density', i):<18}"
             )
             print(row)

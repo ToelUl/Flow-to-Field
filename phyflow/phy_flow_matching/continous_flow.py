@@ -543,7 +543,10 @@ class CFMExecutor:
         )
 
         # Compute loss (e.g., MSE between predicted and target velocity).
-        loss = self.loss_fn(model_output, path_sample.dx_t)
+        # loss = self.loss_fn(model_output, path_sample.dx_t)
+        t_shape = path_sample.x_t.shape
+        v_theta = (model_output - path_sample.x_t) / (torch.ones_like(path_sample.x_t) - path_sample.t.view(t_shape[0],1,1,1).expand(model_output.shape))
+        loss = self.loss_fn(v_theta, path_sample.dx_t)
 
         if kinetic_regularization is not None:
             kinetic_loss = torch.pow(model_output, 2).mean() * kinetic_regularization
