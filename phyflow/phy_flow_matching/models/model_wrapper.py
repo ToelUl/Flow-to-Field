@@ -44,7 +44,7 @@ class CFMWrapper(ModelWrapper):
         """
         batch_size = x.shape[0]
 
-        # --- Time Tensor Broadcasting Logic (Unchanged) ---
+        # --- Time Tensor Broadcasting Logic ---
         original_t_shape = t.shape
         if t.ndim == 0:
             # Expand scalar time tensor to batch size
@@ -63,5 +63,8 @@ class CFMWrapper(ModelWrapper):
             )
 
         # --- Call the wrapped model's forward method ---
-        return self.model.forward(x, t, conditions=conditions)
+        # return self.model.forward(x, t, conditions=conditions)
+        x_theta = self.model.forward(x, t, conditions=conditions)
+        return (x_theta - x) / (torch.ones_like(x_theta) - t.view(t.shape[0],1,1,1).expand(x_theta.shape))
+
 
